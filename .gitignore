@@ -1,0 +1,52 @@
+# ============================================================
+# Ball Tracer PC — .gitignore
+# ============================================================
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ROS2 / colcon
+install/
+log/
+.colcon/
+compile_commands.json
+rosbag2_*/
+*.db3
+*.mcap
+*.bag
+
+# Environments
+.venv/
+.venv_clean/
+.venv_ros2/
+venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+
+*.log
+
+*.mp4
