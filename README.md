@@ -9,7 +9,7 @@ without the sibling `realsense-ros` repository.
 The default config is
 `src/realsense_camera_ros/config/camera_d435i.json`. It selects the first
 connected device whose reported name contains `D435I` and enables synchronized
-1280x720 at 30 FPS color and depth streams.
+1280x720 color plus 848x480 depth and infrared streams at 30 FPS.
 
 If multiple D435i cameras are connected, device ordering is not guaranteed.
 Add a `serial_no` parameter to the JSON when deterministic selection is needed.
@@ -36,6 +36,13 @@ Use the installed default config:
 ros2 launch realsense_camera_ros realsense_camera.launch.py
 ```
 
+Launch the camera and the point-cloud RViz layout with color, depth, and both
+infrared streams:
+
+```bash
+ros2 launch realsense_camera_ros realsense_camera_rviz.launch.py
+```
+
 Or provide another JSON config. `config` is the launch file's only argument:
 
 ```bash
@@ -49,6 +56,9 @@ Primary topics:
 - `/realsense/camera0/color/camera_info`
 - `/realsense/camera0/depth/image_rect_raw`
 - `/realsense/camera0/depth/camera_info`
+- `/realsense/camera0/depth/color/points`
+- `/realsense/camera0/infra1/image_rect_raw`
+- `/realsense/camera0/infra2/image_rect_raw`
 
 The upstream source provenance and license notices are under
 `src/realsense-ros/`.

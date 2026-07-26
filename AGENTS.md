@@ -10,6 +10,7 @@
 8. If asked to explain a function's inputs and outputs, include the input output data format and provide a concrete example of the input output data.
 9. Add short comments in understandable English on parts that are not obvious or hard to follow. Use section dividers (e.g. `// ── Section name ──`) to separate logical groups. Do not over-comment obvious code.
 10. Do not remove or rephrase existing comments unless explicitly asked. Preserve the user's original comments as-is.
+11. If you need information about `src/realsense-ros`, check `memory.md` first.
 
 
 ## Tracker Launching
