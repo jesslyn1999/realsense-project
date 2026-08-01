@@ -1,0 +1,21 @@
+{
+    "camera_name": "camera0",
+    "camera_namespace": "realsense",
+    "device_type": "D435",
+    "enable_color": true,
+    "rgb_camera.color_profile": "1280x720x30",
+    "rgb_camera.color_format": "RGB8",
+    "enable_depth": true,
+    "depth_module.depth_profile": "848x480x30",
+    "depth_module.infra_profile": "848x480x30",
+    "depth_module.depth_format": "Z16",
+    "enable_infra": false,
+    "enable_infra1": true,
+    "enable_infra2": true,
+    "enable_sync": true,
+    "enable_gyro": false,
+    "enable_accel": false,
+    "publish_tf": true,
+    "pointcloud.enable": true,
+    "align_depth.enable": true
+}

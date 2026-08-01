@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Object Scanner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="control-panel">
+        <div>
+          <p class="eyebrow">RealSense</p>
+          <h1>Object Scanner</h1>
+          <p class="subtitle">World-frame color-filtered point capture</p>
+        </div>
+
+        <section aria-labelledby="recording-heading">
+          <div class="section-heading">
+            <h2 id="recording-heading">Recording</h2>
+            <span id="state-badge" class="state-badge stopped">Stopped</span>
+          </div>
+          <div class="controls">
+            <button id="start-button" class="primary">Start</button>
+            <button id="pause-button">Pause</button>
+            <button id="resume-button">Resume</button>
+            <button id="stop-button" class="danger">Stop</button>
+          </div>
+        </section>
+
+        <section aria-labelledby="color-heading">
+          <h2 id="color-heading">Reference color</h2>
+          <div class="color-value">
+            <input
+              id="reference-color"
+              type="color"
+              value="#00ff00"
+              aria-label="Reference color"
+            >
+            <div>
+              <strong id="reference-hex">#00FF00</strong>
+              <span id="reference-rgb">RGB 0, 255, 0</span>
+            </div>
+          </div>
+          <div class="color-actions">
+            <button id="apply-color-button" class="primary">Apply color</button>
+            <button id="camera-color-button">Pick from camera</button>
+          </div>
+        </section>
+
+        <section aria-labelledby="session-heading">
+          <h2 id="session-heading">Session</h2>
+          <dl class="stats">
+            <div>
+              <dt>Recorded points</dt>
+              <dd id="total-points">—</dd>
+            </div>
+            <div>
+              <dt>Displayed points</dt>
+              <dd id="displayed-points">—</dd>
+            </div>
+          </dl>
+          <p id="database-path" class="database-path">No recording selected</p>
+        </section>
+
+        <section aria-labelledby="view-heading">
+          <h2 id="view-heading">View</h2>
+          <div class="view-controls">
+            <button id="fit-button">Fit cloud</button>
+            <button id="reset-button">Reset view</button>
+          </div>
+          <p class="hint">Drag to orbit · Scroll to zoom · Right-drag to pan</p>
+        </section>
+
+        <p id="message" class="message" role="status" aria-live="polite">
+          Connecting to scanner…
+        </p>
+      </aside>
+
+      <section id="viewer" class="viewer" aria-label="3D point-cloud viewer">
+        <div id="viewer-placeholder" class="viewer-placeholder">
+          <span class="placeholder-mark"></span>
+          <p>Pause a recording to inspect captured points.</p>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="camera-color-dialog" class="camera-dialog">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">RealSense RGB</p>
+          <h2>Pick reference color</h2>
+        </div>
+        <button id="close-camera-button" class="icon-button" aria-label="Close">
+          ×
+        </button>
+      </div>
+      <div class="camera-picker">
+        <div class="camera-preview-shell">
+          <canvas
+            id="camera-preview"
+            aria-label="Captured camera image"
+          ></canvas>
+          <p id="camera-instruction">
+            Move over the image to magnify pixels, then click one.
+          </p>
+        </div>
+        <aside class="loupe-panel">
+          <canvas
+            id="pixel-loupe"
+            width="180"
+            height="180"
+            aria-label="Magnified camera pixels"
+          ></canvas>
+          <div class="sample-result">
+            <span
+              id="sample-swatch"
+              class="sample-swatch"
+              aria-hidden="true"
+            ></span>
+            <div>
+              <strong id="sample-rgb">No pixel selected</strong>
+              <span id="sample-position">5×5 average</span>
+            </div>
+          </div>
+        </aside>
+      </div>
+      <div class="dialog-actions">
+        <button id="refresh-camera-button">Capture again</button>
+        <span class="dialog-spacer"></span>
+        <button id="cancel-camera-button">Cancel</button>
+        <button id="use-camera-color-button" class="primary" disabled>
+          Use selected color
+        </button>
+      </div>
+    </dialog>
+
+    <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
