@@ -30,8 +30,16 @@ def _pointcloud_records(message: PointCloud2) -> np.ndarray:
     )
     point_count = message.width * message.height
     packed_row_size = message.width * message.point_step
-    if message.row_step == packed_row_size:
+    packed_data_size = point_count * message.point_step
+    if len(message.data) == packed_data_size:
         return np.frombuffer(message.data, dtype=dtype, count=point_count)
+
+    expected_data_size = message.height * message.row_step
+    if (
+        message.row_step < packed_row_size
+        or len(message.data) != expected_data_size
+    ):
+        raise ValueError("Point cloud data size does not match its dimensions")
 
     rows = np.frombuffer(message.data, dtype=np.uint8).reshape(
         message.height,

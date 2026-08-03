@@ -9,7 +9,7 @@ web server:
 ```bash
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install \
-  --packages-select object_scanner object_scanner_web \
+  --packages-select object_scanner_interfaces object_scanner object_scanner_web \
   --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DCMAKE_BUILD_TYPE=Debug
 ln -sf build/compile_commands.json compile_commands.json
@@ -17,9 +17,9 @@ source install/setup.bash
 ros2 launch object_scanner_web object_scanner_web.launch.py
 ```
 
-The scanner still requires a synchronized camera-to-world
-`geometry_msgs/msg/TransformStamped` publisher on
-`/object_scanner/camera_to_world`.
+The web server publishes synchronized camera-to-world
+`object_scanner_interfaces/msg/NamedTransform` messages on
+`/object_scanner/camera_to_world` when requested from the page.
 
 Open `http://<robot-ip>:5000` from a browser on the same LAN. The server binds
 to all interfaces and has no authentication, so it must be used only on the
@@ -28,14 +28,54 @@ OrbitControls are loaded from jsDelivr, so the browser needs internet access.
 
 ## Controls
 
-- **Start** creates a new `scan_<perf_counter_ns>.sqlite3` session.
+- Enter a session name using letters, numbers, `_`, or `-`.
+- **Start** creates
+  `<output_directory>/<session_name>/recording.sqlite3`. Start fails instead of
+  overwriting an existing session directory.
 - **Pause** commits the session, stops accepting frames, and loads the recorded
   points into Three.js.
 - **Resume** appends new frames to the same SQLite file.
-- **Stop** commits and closes the session, then displays its final points.
+- **Stop** writes per-frame transformation details to `metadata.json`,
+  checkpoints and closes the standalone SQLite file, removes WAL mode, then
+  displays its final points. Close external database viewers before Stop so
+  they cannot block finalization.
+
+Refreshing or reopening the browser restores the active session name, recording
+state, database path, and available controls from the still-running web server.
+The recording continues until **Stop** succeeds.
 
 The viewer samples uniformly across the complete recorded sequence and displays
 at most 250,000 points. The database retains every filtered point.
+
+Finalized session folders can also be selected for manual cumulative replay.
+The replay dock appears at the bottom of the Three.js viewer. **Next** adds the
+next frame without removing earlier points; **Previous** removes only the most
+recent frame so the viewer again represents frames 1 through the selected
+frame. **Exit replay** returns to the normal viewer. A global 250,000-point
+display budget is shared across all replay frames. Replay is disabled until the
+active recording session has been stopped.
+
+The replay dock's camera overlay checkbox shows the current frame's camera
+source, a 0.25 m optical +Z ray, and the standard red-X, green-Y, blue-Z axis
+guide using that frame's recorded transformation matrix.
+
+## Transformation matrices
+
+The page displays the matrix that the next **Publish transformation matrix**
+click will use. Each click publishes that matrix for exactly the next point
+cloud, copying its timestamp and frame ID so the scanner can synchronize the
+messages. After publishing, the page advances to the next entry, updates its
+`Matrix i / total` indicator, and wraps to the start of the list.
+
+**Previous** and **Next** change only the displayed selection and wrap at both
+ends. They are disabled while a transformation publish is active.
+
+Matrices are loaded at startup from
+`object_scanner/resource/transformation_matrices.json`. The default `identity`
+entry leaves XYZ unchanged. Replace it or add entries using calibrated rigid
+camera-to-world matrices for the capture locations used by the scanner. The
+publish control is available in all recording states; points are written only
+when the scanner is recording.
 
 ## Reference color
 
@@ -62,13 +102,21 @@ ros2 launch object_scanner_web object_scanner_web.launch.py \
 ## HTTP API
 
 - `GET /api/status`
+- `POST /api/transformation/publish`
+- `POST /api/transformation/step` with JSON `{ "delta": -1 }` or
+  `{ "delta": 1 }`
 - `POST /api/reference-color`
 - `GET /api/camera-frame` while stopped
-- `POST /api/recording/start`
+- `POST /api/recording/start` with JSON
+  `{ "session_name": "green_cup_01" }`
 - `POST /api/recording/pause`
 - `POST /api/recording/resume`
 - `POST /api/recording/stop`
 - `GET /api/points` while paused or stopped
+- `GET /api/sessions`
+- `GET /api/sessions/<name>/frames`
+- `GET /api/sessions/<name>/frames/<id>` with optional `max_points` from
+  `1` through `250000`
 
 The points endpoint returns a binary `PCD1` payload: a 12-byte header containing
 the displayed and total point counts, followed by float32 XYZ values and uint8

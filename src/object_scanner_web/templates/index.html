@@ -4,6 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Object Scanner</title>
+    <script>
+      try {
+        const savedTheme = localStorage.getItem("object-scanner-theme");
+        document.documentElement.dataset.theme =
+          savedTheme === "light" ? "light" : "dark";
+      } catch {
+        document.documentElement.dataset.theme = "dark";
+      }
+    </script>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
     <script type="importmap">
       {
@@ -17,10 +26,20 @@
   <body>
     <main class="app-shell">
       <aside class="control-panel">
-        <div>
-          <p class="eyebrow">RealSense</p>
-          <h1>Object Scanner</h1>
-          <p class="subtitle">World-frame color-filtered point capture</p>
+        <div class="control-panel-content">
+        <div class="app-header">
+          <div>
+            <p class="eyebrow">RealSense</p>
+            <h1>Object Scanner</h1>
+            <p class="subtitle">World-frame color-filtered point capture</p>
+          </div>
+          <button
+            id="theme-toggle"
+            class="theme-toggle"
+            type="button"
+            aria-label="Switch to light theme"
+            aria-pressed="false"
+          >Light</button>
         </div>
 
         <section aria-labelledby="recording-heading">
@@ -28,12 +47,58 @@
             <h2 id="recording-heading">Recording</h2>
             <span id="state-badge" class="state-badge stopped">Stopped</span>
           </div>
+          <label class="session-name-field" for="session-name">
+            <span>Session name</span>
+            <input
+              id="session-name"
+              type="text"
+              pattern="[A-Za-z0-9_-]+"
+              placeholder="green_cup_01"
+              autocomplete="off"
+              aria-describedby="session-name-hint"
+              required
+            >
+          </label>
+          <p id="session-name-hint" class="hint session-name-hint">
+            Letters, numbers, _ and - · saved in scans/&lt;name&gt;/
+          </p>
           <div class="controls">
-            <button id="start-button" class="primary">Start</button>
+            <button id="start-button" class="primary" disabled>Start</button>
             <button id="pause-button">Pause</button>
             <button id="resume-button">Resume</button>
             <button id="stop-button" class="danger">Stop</button>
           </div>
+        </section>
+
+        <section aria-labelledby="transformation-heading">
+          <h2 id="transformation-heading">Transformation</h2>
+          <div class="transformation-value">
+            <div>
+              <strong id="transformation-name">current</strong>
+              <span id="transformation-parent-frame">Parent frame: world</span>
+            </div>
+            <span id="transformation-position" class="transformation-position">
+              Matrix 1 / 4
+            </span>
+          </div>
+          <div class="transformation-nav">
+            <button id="previous-transformation-button">← Previous</button>
+            <button id="next-transformation-button">Next →</button>
+          </div>
+          <pre
+            id="transformation-matrix"
+            class="matrix-preview"
+            aria-label="Transformation matrix to publish"
+          >[1, 0, 0, 0]
+[0, 1, 0, 0]
+[0, 0, 1, 0]
+[0, 0, 0, 1]</pre>
+          <button id="publish-transformation-button" class="primary">
+            Publish transformation matrix
+          </button>
+          <p class="hint">
+            Publishes this matrix for the next point-cloud frame.
+          </p>
         </section>
 
         <section aria-labelledby="color-heading">
@@ -71,6 +136,19 @@
           <p id="database-path" class="database-path">No recording selected</p>
         </section>
 
+        <section aria-labelledby="replay-heading">
+          <h2 id="replay-heading">Saved scan replay</h2>
+          <label class="select-field" for="saved-session">
+            <span>Saved session</span>
+            <select id="saved-session" disabled>
+              <option value="">No saved sessions</option>
+            </select>
+          </label>
+          <p class="hint">
+            Select a finalized session to enter manual cumulative replay.
+          </p>
+        </section>
+
         <section aria-labelledby="view-heading">
           <h2 id="view-heading">View</h2>
           <div class="view-controls">
@@ -79,6 +157,7 @@
           </div>
           <p class="hint">Drag to orbit · Scroll to zoom · Right-drag to pan</p>
         </section>
+        </div>
 
         <p id="message" class="message" role="status" aria-live="polite">
           Connecting to scanner…
@@ -88,7 +167,22 @@
       <section id="viewer" class="viewer" aria-label="3D point-cloud viewer">
         <div id="viewer-placeholder" class="viewer-placeholder">
           <span class="placeholder-mark"></span>
-          <p>Pause a recording to inspect captured points.</p>
+          <p>Pause recording or choose a saved session to inspect points.</p>
+        </div>
+        <div id="replay-dock" class="replay-dock" hidden>
+          <div class="replay-dock-status">
+            <strong id="replay-session-name">Replay</strong>
+            <span id="replay-position">Frame 1 / 1</span>
+          </div>
+          <label class="camera-overlay-toggle">
+            <input id="camera-overlay-checkbox" type="checkbox">
+            <span>Show camera source and directions</span>
+          </label>
+          <div class="replay-dock-controls">
+            <button id="replay-previous-button">← Previous</button>
+            <button id="replay-next-button" class="primary">Next →</button>
+            <button id="replay-exit-button">Exit replay</button>
+          </div>
         </div>
       </section>
     </main>

@@ -20,7 +20,7 @@ Add a `serial_no` parameter to the JSON when deterministic selection is needed.
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install \
   --packages-select realsense2_camera_msgs realsense2_camera realsense_camera_ros \
-  turntable object_scanner \
+  object_scanner_interfaces object_scanner object_scanner_web \
   --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Debug
 source install/setup.bash
@@ -61,21 +61,16 @@ Primary topics:
 - `/realsense/camera0/infra1/image_rect_raw`
 - `/realsense/camera0/infra2/image_rect_raw`
 
-## Rotating-object capture
+## Object scanning
 
-`object_scanner` continuously records D435i RGB-D data to a ROS bag. It does
-not open the turntable serial device. If joint feedback is available, a scan
-captures 15 stationary RGB-D frames every 5 degrees; without feedback it
-captures one stationary side.
+`object_scanner` filters colored points, applies a named camera-to-world
+transformation, and stores each session under `scans/<session_name>/` as
+`recording.sqlite3` plus per-frame transformation metadata.
 
 ```bash
-ros2 launch object_scanner object_scanner.launch.py
-ros2 service call /object_scanner/start_scan std_srvs/srv/Trigger
+ros2 launch object_scanner_web object_scanner_web.launch.py
 ```
 
-Turntable position feedback is published on `/turntable/joint_states`; absolute
-position commands use `/turntable/cmd_position` in counter-clockwise radians.
-The scanner launch does not start the turntable node.
 See `src/object_scanner/README.md` for output files and parameters.
 
 The upstream source provenance and license notices are under

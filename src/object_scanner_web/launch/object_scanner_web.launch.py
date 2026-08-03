@@ -33,6 +33,7 @@ def generate_launch_description():
         executable="web_server",
         parameters=[
             {
+                "output_directory": ParameterValue(output_directory),
                 "target_rgb": ParameterValue(target_rgb),
             }
         ],

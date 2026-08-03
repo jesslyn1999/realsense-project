@@ -1,19 +1,23 @@
 """Filter, transform, and record synchronized RealSense point clouds."""
 
 from enum import Enum
+import json
 import math
 from pathlib import Path
 import sqlite3
 import time
 
-from geometry_msgs.msg import TransformStamped
 import message_filters
+import numpy as np
 from object_scanner.pointcloud import (
     filter_colored_points,
     transform_filtered_cloud,
-    transform_to_matrix,
 )
-from object_scanner.sqlite_recording import SqliteRecording
+from object_scanner.sqlite_recording import (
+    SqliteRecording,
+    validated_session_name,
+)
+from object_scanner_interfaces.msg import NamedTransform
 from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.node import Node
@@ -44,6 +48,7 @@ class ObjectScannerNode(Node):
         self.declare_parameter("output_directory", "scans")
         self.declare_parameter("target_rgb", [0, 255, 0])
         self.declare_parameter("lab_threshold", 15.0)
+        self.declare_parameter("session_name", "")
         self._load_parameters()
 
         self._state = RecordingState.STOPPED
@@ -65,7 +70,7 @@ class ObjectScannerNode(Node):
         )
         self._transform_subscriber = message_filters.Subscriber(
             self,
-            TransformStamped,
+            NamedTransform,
             TRANSFORM_TOPIC,
             qos_profile=qos_profile_sensor_data,
         )
@@ -100,6 +105,11 @@ class ObjectScannerNode(Node):
             "~/stop_recording",
             self._on_stop_recording,
         )
+        self.create_service(
+            Trigger,
+            "~/recording_status",
+            self._on_recording_status,
+        )
 
     def _load_parameters(self) -> None:
         self._output_directory = Path(
@@ -111,6 +121,7 @@ class ObjectScannerNode(Node):
         self._lab_threshold = float(
             self.get_parameter("lab_threshold").value
         )
+        self._session_name = self.get_parameter("session_name").value
 
         if not math.isfinite(self._lab_threshold) or self._lab_threshold < 0:
             raise ValueError("lab_threshold must be finite and non-negative")
@@ -143,16 +154,28 @@ class ObjectScannerNode(Node):
         parameters: list[Parameter],
     ) -> SetParametersResult:
         target_rgb = self._target_rgb
+        session_name = self._session_name
         for parameter in parameters:
-            if parameter.name != "target_rgb":
+            if parameter.name not in {"session_name", "target_rgb"}:
                 continue
             if self._state is not RecordingState.STOPPED:
+                reason = (
+                    f"{parameter.name} can change only while "
+                    "recording is stopped"
+                )
+                self.get_logger().error(
+                    f"Rejected parameter '{parameter.name}' while recorder "
+                    f"is {self._state.value}: {reason}"
+                )
                 return SetParametersResult(
                     successful=False,
-                    reason="target_rgb can change only while recording is stopped",
+                    reason=reason,
                 )
             try:
-                target_rgb = self._validated_target_rgb(parameter.value)
+                if parameter.name == "target_rgb":
+                    target_rgb = self._validated_target_rgb(parameter.value)
+                else:
+                    session_name = validated_session_name(parameter.value)
             except ValueError as error:
                 return SetParametersResult(
                     successful=False,
@@ -160,6 +183,7 @@ class ObjectScannerNode(Node):
                 )
 
         self._target_rgb = target_rgb
+        self._session_name = session_name
         return SetParametersResult(successful=True)
 
     # ── Synchronized processing ────────────────────────────────────────
@@ -168,7 +192,7 @@ class ObjectScannerNode(Node):
         self,
         pointcloud: PointCloud2,
         _color_image: Image,
-        transform: TransformStamped,
+        transform: NamedTransform,
     ) -> None:
         if self._state is not RecordingState.RECORDING:
             return
@@ -182,15 +206,19 @@ class ObjectScannerNode(Node):
         if not transform.header.frame_id:
             self.get_logger().error("Transform world frame is empty")
             return
+        if not transform.transformation_name:
+            self.get_logger().error("Transform name is empty")
+            return
 
         try:
+            matrix = np.asarray(transform.matrix, dtype=np.float64).reshape(4, 4)
             xyz, rgb = filter_colored_points(
                 pointcloud,
                 self._target_rgb,
                 self._lab_threshold,
             )
             world_xyz, world_rgb = transform_filtered_cloud(
-                transform_to_matrix(transform),
+                matrix,
                 xyz,
                 rgb,
             )
@@ -205,16 +233,39 @@ class ObjectScannerNode(Node):
                 source_sec=pointcloud.header.stamp.sec,
                 source_nanosec=pointcloud.header.stamp.nanosec,
                 frame_id=transform.header.frame_id,
+                transformation_name=transform.transformation_name,
+                transformation_matrix=matrix,
                 xyz=world_xyz,
                 rgb=world_rgb,
             )
-        except sqlite3.Error as error:
+        except (sqlite3.Error, ValueError) as error:
             self._state = RecordingState.PAUSED
             self.get_logger().error(
                 f"SQLite write failed; recording paused: {error}"
             )
 
     # ── Recording services ─────────────────────────────────────────────
+
+    def _on_recording_status(
+        self,
+        _request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        response.success = True
+        response.message = json.dumps(
+            {
+                "state": self._state.value,
+                "database_path": (
+                    str(self._database_path)
+                    if self._database_path is not None
+                    else None
+                ),
+                "session_name": self._session_name or None,
+                "target_rgb": list(self._target_rgb),
+            },
+            separators=(",", ":"),
+        )
+        return response
 
     def _on_start_recording(
         self,
@@ -228,13 +279,12 @@ class ObjectScannerNode(Node):
                 f"Recorder is already {self._state.value}",
             )
 
-        database_path = (
-            self._output_directory / f"scan_{time.perf_counter_ns()}.sqlite3"
-        )
         try:
-            self._output_directory.mkdir(parents=True, exist_ok=True)
-            recording = SqliteRecording(database_path)
-        except (OSError, sqlite3.Error) as error:
+            session_name = validated_session_name(self._session_name)
+            session_directory = self._output_directory / session_name
+            recording = SqliteRecording(session_directory)
+            database_path = recording.path
+        except (OSError, sqlite3.Error, ValueError) as error:
             return self._set_response(
                 response,
                 False,
@@ -308,7 +358,7 @@ class ObjectScannerNode(Node):
         database_path = self._database_path
         try:
             self._close_recording()
-        except sqlite3.Error as error:
+        except (OSError, sqlite3.Error) as error:
             return self._set_response(
                 response,
                 False,
@@ -346,7 +396,7 @@ class ObjectScannerNode(Node):
             return
         try:
             self._close_recording()
-        except sqlite3.Error as error:
+        except (OSError, sqlite3.Error) as error:
             self.get_logger().error(f"Cannot close recording: {error}")
 
 

@@ -17,5 +17,7 @@
     "enable_accel": false,
     "publish_tf": true,
     "pointcloud.enable": true,
+    "pointcloud.stream_filter": 2,
+    "pointcloud.stream_index_filter": 0,
     "align_depth.enable": true
 }

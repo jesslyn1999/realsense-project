@@ -1,0 +1,139 @@
+{
+  "format_version": 1,
+  "session_name": "cup",
+  "database_file": "recording.sqlite3",
+  "frames": [
+    {
+      "sqlite_frame_id": 1,
+      "source_sec": 1785611577,
+      "source_nanosec": 971385498,
+      "transformation_name": "current",
+      "parent_frame_id": "world",
+      "matrix": [
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    {
+      "sqlite_frame_id": 2,
+      "source_sec": 1785611585,
+      "source_nanosec": 510164307,
+      "transformation_name": "right_side",
+      "parent_frame_id": "world",
+      "matrix": [
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    {
+      "sqlite_frame_id": 3,
+      "source_sec": 1785611590,
+      "source_nanosec": 580507813,
+      "transformation_name": "left_side",
+      "parent_frame_id": "world",
+      "matrix": [
+        [
+          0.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    {
+      "sqlite_frame_id": 4,
+      "source_sec": 1785611595,
+      "source_nanosec": 183846191,
+      "transformation_name": "opposite",
+      "parent_frame_id": "world",
+      "matrix": [
+        [
+          -1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    }
+  ]
+}

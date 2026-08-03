@@ -12,24 +12,31 @@ import pytest
 from sensor_msgs.msg import PointCloud2, PointField
 
 
-def make_cloud(points):
+def make_cloud(points, rgb_offset=12):
     message = PointCloud2()
     message.height = 1
     message.width = len(points)
     message.is_bigendian = False
-    message.point_step = 16
+    message.point_step = rgb_offset + 4
     message.row_step = message.width * message.point_step
     message.fields = [
         PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
         PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
         PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-        PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
+        PointField(
+            name="rgb",
+            offset=rgb_offset,
+            datatype=PointField.FLOAT32,
+            count=1,
+        ),
     ]
     data = bytearray()
     for x, y, z, (red, green, blue) in points:
         packed = (red << 16) | (green << 8) | blue
         packed_float = struct.unpack("<f", struct.pack("<I", packed))[0]
-        data.extend(struct.pack("<ffff", x, y, z, packed_float))
+        data.extend(struct.pack("<fff", x, y, z))
+        data.extend(bytes(rgb_offset - 12))
+        data.extend(struct.pack("<f", packed_float))
     message.data = bytes(data)
     return message
 
@@ -49,6 +56,19 @@ def test_green_filter_keeps_close_finite_points():
 
     np.testing.assert_allclose(xyz, [[0.0, 0.0, 0.5], [0.1, 0.0, 0.5]])
     np.testing.assert_array_equal(rgb, [[0, 255, 0], [0, 240, 0]])
+
+
+def test_compact_cloud_ignores_oversized_row_step():
+    cloud = make_cloud(
+        [(0.0, 0.0, 0.5, (0, 255, 0))],
+        rgb_offset=16,
+    )
+    cloud.row_step = 848 * 480 * cloud.point_step
+
+    xyz, rgb = filter_colored_points(cloud, (0, 255, 0), 0.0)
+
+    np.testing.assert_allclose(xyz, [[0.0, 0.0, 0.5]])
+    np.testing.assert_array_equal(rgb, [[0, 255, 0]])
 
 
 def test_transform_rotates_translates_and_preserves_color():
