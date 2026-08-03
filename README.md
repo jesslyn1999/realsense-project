@@ -73,5 +73,24 @@ ros2 launch object_scanner_web object_scanner_web.launch.py
 
 See `src/object_scanner/README.md` for output files and parameters.
 
-The upstream source provenance and license notices are under
-`src/realsense-ros/`.
+## Orbbec DaBai DC1 scanning
+
+The isolated Orbbec scanner uses the first detected DaBai DC1 and does not
+modify or launch the RealSense scanner packages.
+
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install \
+  --packages-select orbbec_camera_msgs orbbec_camera \
+  object_scanner_interfaces object_scanner_web_orbbec \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Debug
+source install/setup.bash
+ros2 launch object_scanner_web_orbbec object_scanner_web.launch.py
+```
+
+The web interface is available on port 5000. The scanner consumes
+`/camera/color/image_raw` and `/camera/depth_registered/points`.
+
+Upstream source provenance and license notices are under `src/realsense-ros/`
+and `src/orbbec-ros/`.
