@@ -3,6 +3,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 const viewer = document.querySelector("#viewer");
 const placeholder = document.querySelector("#viewer-placeholder");
+const orientationGizmo = document.querySelector("#orientation-gizmo");
 const pointCoordinateTooltip = document.querySelector(
   "#point-coordinate-tooltip",
 );
@@ -78,6 +79,69 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 viewer.appendChild(renderer.domElement);
+
+const gizmoScene = new THREE.Scene();
+const gizmoCamera = new THREE.OrthographicCamera(
+  -1.05,
+  1.05,
+  1.05,
+  -1.05,
+  0.1,
+  10,
+);
+const gizmoRenderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: true,
+});
+gizmoRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+gizmoRenderer.setSize(104, 104, false);
+gizmoRenderer.outputColorSpace = THREE.SRGBColorSpace;
+orientationGizmo.appendChild(gizmoRenderer.domElement);
+
+function createAxisLabel(text, color, position) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const context = canvas.getContext("2d");
+  context.fillStyle = color;
+  context.font = "700 42px sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(text, 32, 34);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const label = new THREE.Sprite(
+    new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    }),
+  );
+  label.position.copy(position);
+  label.scale.setScalar(0.3);
+  gizmoScene.add(label);
+}
+
+const gizmoOrigin = new THREE.Vector3();
+const gizmoAxes = [
+  ["X", new THREE.Vector3(1, 0, 0), 0xe45b5b, "#e45b5b"],
+  ["Y", new THREE.Vector3(0, 1, 0), 0x45c878, "#45c878"],
+  ["Z", new THREE.Vector3(0, 0, 1), 0x4f8fe8, "#4f8fe8"],
+];
+for (const [label, direction, color, cssColor] of gizmoAxes) {
+  gizmoScene.add(
+    new THREE.ArrowHelper(
+      direction,
+      gizmoOrigin,
+      0.68,
+      color,
+      0.18,
+      0.11,
+    ),
+  );
+  createAxisLabel(label, cssColor, direction.clone().multiplyScalar(0.87));
+}
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -1153,6 +1217,14 @@ function animate() {
   }
   controls.update();
   renderer.render(scene, camera);
+  gizmoCamera.position
+    .copy(camera.position)
+    .sub(controls.target)
+    .normalize()
+    .multiplyScalar(3);
+  gizmoCamera.up.copy(camera.up);
+  gizmoCamera.lookAt(gizmoOrigin);
+  gizmoRenderer.render(gizmoScene, gizmoCamera);
   requestAnimationFrame(animate);
 }
 

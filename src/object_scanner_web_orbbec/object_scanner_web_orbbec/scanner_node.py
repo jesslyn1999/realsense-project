@@ -1,9 +1,11 @@
 """Filter, transform, and record synchronized Orbbec point clouds."""
 
+from collections import deque
 from enum import Enum
 import json
 import math
 from pathlib import Path
+import shutil
 import sqlite3
 import time
 
@@ -22,7 +24,7 @@ from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
 from std_srvs.srv import Trigger
 
@@ -30,7 +32,12 @@ POINTCLOUD_TOPIC = "/camera/depth_registered/points"
 COLOR_TOPIC = "/camera/color/image_raw"
 TRANSFORM_TOPIC = "/object_scanner_orbbec/camera_to_world"
 SYNC_QUEUE_SIZE = 30
-SYNC_SLOP_S = 0.05
+SYNC_SLOP_S = 0.1
+DIAGNOSTIC_SESSION_NAME = "do_check"
+TRANSFORM_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+)
 
 
 class RecordingState(Enum):
@@ -54,6 +61,20 @@ class OrbbecObjectScannerNode(Node):
         self._state = RecordingState.STOPPED
         self._recording: SqliteRecording | None = None
         self._database_path: Path | None = None
+        self._recent_pointcloud_stamps = deque(maxlen=SYNC_QUEUE_SIZE * 2)
+        self._last_color_stamp: tuple[int, int] | None = None
+        self._pending_color_attempts: dict[
+            int,
+            tuple[tuple[int, int], tuple[int, int] | None],
+        ] = {}
+        self._pending_pointcloud_attempts: dict[
+            tuple[int, int],
+            list[int],
+        ] = {}
+        self._attempt_ids_by_transform: dict[
+            tuple[int, int, str],
+            int,
+        ] = {}
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
         self._pointcloud_subscriber = message_filters.Subscriber(
@@ -72,7 +93,16 @@ class OrbbecObjectScannerNode(Node):
             self,
             NamedTransform,
             TRANSFORM_TOPIC,
-            qos_profile=qos_profile_sensor_data,
+            qos_profile=TRANSFORM_QOS,
+        )
+        self._pointcloud_subscriber.registerCallback(
+            self._on_pointcloud_received
+        )
+        self._color_subscriber.registerCallback(
+            self._on_color_received
+        )
+        self._transform_subscriber.registerCallback(
+            self._on_transform_received
         )
         self._synchronizer = message_filters.ApproximateTimeSynchronizer(
             [
@@ -186,12 +216,138 @@ class OrbbecObjectScannerNode(Node):
         self._session_name = session_name
         return SetParametersResult(successful=True)
 
+    # ── Stream and publish-attempt tracking ────────────────────────────
+
+    @staticmethod
+    def _stamp(message) -> tuple[int, int]:
+        return (
+            int(message.header.stamp.sec),
+            int(message.header.stamp.nanosec),
+        )
+
+    @staticmethod
+    def _stamp_ns(stamp: tuple[int, int]) -> int:
+        return stamp[0] * 1_000_000_000 + stamp[1]
+
+    def _reset_publish_attempt_tracking(self) -> None:
+        self._recent_pointcloud_stamps.clear()
+        self._last_color_stamp = None
+        self._pending_color_attempts.clear()
+        self._pending_pointcloud_attempts.clear()
+        self._attempt_ids_by_transform.clear()
+
+    def _append_raw_stream_timestamp(self, stream: str, message) -> None:
+        if self._session_name != DIAGNOSTIC_SESSION_NAME:
+            return
+        assert self._recording is not None
+        self._recording.append_stream_timestamp(
+            stream=stream,
+            source_sec=message.header.stamp.sec,
+            source_nanosec=message.header.stamp.nanosec,
+            arrival_perf_counter_ns=time.perf_counter_ns(),
+        )
+
+    def _pause_after_timestamp_error(self, error: Exception) -> None:
+        self._state = RecordingState.PAUSED
+        self._reset_publish_attempt_tracking()
+        self.get_logger().error(
+            f"Timestamp write failed; recording paused: {error}"
+        )
+
+    def _on_pointcloud_received(self, message: PointCloud2) -> None:
+        if self._state is not RecordingState.RECORDING:
+            return
+        assert self._recording is not None
+        stamp = self._stamp(message)
+        try:
+            self._append_raw_stream_timestamp("pointcloud", message)
+            self._recent_pointcloud_stamps.append(stamp)
+            for attempt_id in self._pending_pointcloud_attempts.pop(stamp, []):
+                self._recording.mark_publish_attempt_pointcloud_received(
+                    attempt_id
+                )
+        except (sqlite3.Error, ValueError) as error:
+            self._pause_after_timestamp_error(error)
+
+    def _on_color_received(self, message: Image) -> None:
+        if self._state is not RecordingState.RECORDING:
+            return
+        assert self._recording is not None
+        stamp = self._stamp(message)
+        stamp_ns = self._stamp_ns(stamp)
+        try:
+            self._append_raw_stream_timestamp("color_image", message)
+            self._last_color_stamp = stamp
+            for attempt_id, (
+                depth_stamp,
+                closest_color,
+            ) in list(self._pending_color_attempts.items()):
+                depth_ns = self._stamp_ns(depth_stamp)
+                if (
+                    closest_color is None
+                    or abs(stamp_ns - depth_ns)
+                    < abs(self._stamp_ns(closest_color) - depth_ns)
+                ):
+                    self._recording.update_publish_attempt_color(
+                        attempt_id,
+                        stamp,
+                    )
+                    closest_color = stamp
+                if stamp_ns >= depth_ns:
+                    self._pending_color_attempts.pop(attempt_id)
+                else:
+                    self._pending_color_attempts[attempt_id] = (
+                        depth_stamp,
+                        closest_color,
+                    )
+        except (sqlite3.Error, TypeError, ValueError) as error:
+            self._pause_after_timestamp_error(error)
+
+    def _on_transform_received(self, message: NamedTransform) -> None:
+        if self._state is not RecordingState.RECORDING:
+            return
+        assert self._recording is not None
+        depth_stamp = self._stamp(message)
+        pointcloud_received = depth_stamp in self._recent_pointcloud_stamps
+        try:
+            self._append_raw_stream_timestamp("transformation", message)
+            attempt_id = self._recording.append_publish_attempt(
+                received_perf_counter_ns=time.perf_counter_ns(),
+                transformation_name=message.transformation_name,
+                depth_sec=depth_stamp[0],
+                depth_nanosec=depth_stamp[1],
+                pointcloud_received=pointcloud_received,
+                color_stamp=self._last_color_stamp,
+            )
+            key = (
+                depth_stamp[0],
+                depth_stamp[1],
+                message.transformation_name,
+            )
+            self._attempt_ids_by_transform[key] = attempt_id
+            if not pointcloud_received:
+                self._pending_pointcloud_attempts.setdefault(
+                    depth_stamp,
+                    [],
+                ).append(attempt_id)
+            if (
+                self._last_color_stamp is None
+                or self._stamp_ns(self._last_color_stamp)
+                < self._stamp_ns(depth_stamp)
+            ):
+                self._pending_color_attempts[attempt_id] = (
+                    depth_stamp,
+                    self._last_color_stamp,
+                )
+        except (sqlite3.Error, ValueError) as error:
+            self._pause_after_timestamp_error(error)
+
     # ── Synchronized processing ────────────────────────────────────────
 
     def _on_synchronized_frame(
         self,
         pointcloud: PointCloud2,
-        _color_image: Image,
+        color_image: Image,
         transform: NamedTransform,
     ) -> None:
         if self._state is not RecordingState.RECORDING:
@@ -228,7 +384,7 @@ class OrbbecObjectScannerNode(Node):
 
         assert self._recording is not None
         try:
-            self._recording.append_frame(
+            frame_id = self._recording.append_frame(
                 recorded_perf_counter_ns=time.perf_counter_ns(),
                 source_sec=pointcloud.header.stamp.sec,
                 source_nanosec=pointcloud.header.stamp.nanosec,
@@ -238,8 +394,25 @@ class OrbbecObjectScannerNode(Node):
                 xyz=world_xyz,
                 rgb=world_rgb,
             )
+            transform_stamp = self._stamp(transform)
+            attempt_id = self._attempt_ids_by_transform.pop(
+                (
+                    transform_stamp[0],
+                    transform_stamp[1],
+                    transform.transformation_name,
+                ),
+                None,
+            )
+            if attempt_id is not None:
+                self._recording.mark_publish_attempt_captured(
+                    attempt_id,
+                    frame_id,
+                    self._stamp(color_image),
+                )
+                self._pending_color_attempts.pop(attempt_id, None)
         except (sqlite3.Error, ValueError) as error:
             self._state = RecordingState.PAUSED
+            self._reset_publish_attempt_tracking()
             self.get_logger().error(
                 f"SQLite write failed; recording paused: {error}"
             )
@@ -282,6 +455,11 @@ class OrbbecObjectScannerNode(Node):
         try:
             session_name = validated_session_name(self._session_name)
             session_directory = self._output_directory / session_name
+            if (
+                session_name == DIAGNOSTIC_SESSION_NAME
+                and session_directory.exists()
+            ):
+                shutil.rmtree(session_directory)
             recording = SqliteRecording(session_directory)
             database_path = recording.path
         except (OSError, sqlite3.Error, ValueError) as error:
@@ -293,6 +471,7 @@ class OrbbecObjectScannerNode(Node):
 
         self._recording = recording
         self._database_path = database_path
+        self._reset_publish_attempt_tracking()
         self._state = RecordingState.RECORDING
         self.get_logger().info(f"Recording filtered points to {database_path}")
         return self._set_response(response, True, str(database_path))
@@ -320,6 +499,7 @@ class OrbbecObjectScannerNode(Node):
             )
 
         self._state = RecordingState.PAUSED
+        self._reset_publish_attempt_tracking()
         self.get_logger().info("Recording paused")
         return self._set_response(
             response,
@@ -339,6 +519,7 @@ class OrbbecObjectScannerNode(Node):
                 f"Cannot resume while recorder is {self._state.value}",
             )
 
+        self._reset_publish_attempt_tracking()
         self._state = RecordingState.RECORDING
         self.get_logger().info("Recording resumed")
         return self._set_response(response, True, "Recording resumed")
@@ -390,6 +571,7 @@ class OrbbecObjectScannerNode(Node):
         self._recording = None
         self._database_path = None
         self._state = RecordingState.STOPPED
+        self._reset_publish_attempt_tracking()
 
     def shutdown(self) -> None:
         if self._recording is None:

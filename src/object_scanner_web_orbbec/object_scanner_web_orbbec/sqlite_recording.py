@@ -47,7 +47,7 @@ class SqliteRecording:
                     value TEXT NOT NULL
                 );
                 INSERT INTO metadata (key, value)
-                VALUES ('format_version', '2');
+                VALUES ('format_version', '4');
 
                 CREATE TABLE frames (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +60,27 @@ class SqliteRecording:
                     point_count INTEGER NOT NULL,
                     xyz BLOB NOT NULL,
                     rgb BLOB NOT NULL
+                );
+
+                CREATE TABLE stream_timestamps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stream TEXT NOT NULL,
+                    source_sec INTEGER NOT NULL,
+                    source_nanosec INTEGER NOT NULL,
+                    arrival_perf_counter_ns INTEGER NOT NULL
+                );
+
+                CREATE TABLE publish_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    received_perf_counter_ns INTEGER NOT NULL,
+                    transformation_name TEXT NOT NULL,
+                    depth_sec INTEGER NOT NULL,
+                    depth_nanosec INTEGER NOT NULL,
+                    pointcloud_received INTEGER NOT NULL,
+                    color_sec INTEGER,
+                    color_nanosec INTEGER,
+                    color_delta_ns INTEGER,
+                    captured_frame_id INTEGER
                 );
                 """
             )
@@ -81,7 +102,7 @@ class SqliteRecording:
         transformation_matrix: np.ndarray,
         xyz: np.ndarray,
         rgb: np.ndarray,
-    ) -> None:
+    ) -> int:
         """Append and commit one world-frame XYZ/RGB array pair."""
         points = np.asarray(xyz, dtype="<f4")
         colors = np.asarray(rgb)
@@ -104,7 +125,7 @@ class SqliteRecording:
         points = np.ascontiguousarray(points)
         colors = np.ascontiguousarray(colors, dtype=np.uint8)
         matrix = np.ascontiguousarray(matrix)
-        self._connection.execute(
+        cursor = self._connection.execute(
             """
             INSERT INTO frames (
                 recorded_perf_counter_ns,
@@ -131,6 +152,153 @@ class SqliteRecording:
             ),
         )
         self._connection.commit()
+        return int(cursor.lastrowid)
+
+    def append_stream_timestamp(
+        self,
+        *,
+        stream: str,
+        source_sec: int,
+        source_nanosec: int,
+        arrival_perf_counter_ns: int,
+    ) -> None:
+        """Append one independently received ROS stream timestamp."""
+        if stream not in {"pointcloud", "transformation", "color_image"}:
+            raise ValueError(f"Unsupported diagnostic stream: {stream}")
+        self._connection.execute(
+            """
+            INSERT INTO stream_timestamps (
+                stream,
+                source_sec,
+                source_nanosec,
+                arrival_perf_counter_ns
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                stream,
+                int(source_sec),
+                int(source_nanosec),
+                int(arrival_perf_counter_ns),
+            ),
+        )
+
+    def append_publish_attempt(
+        self,
+        *,
+        received_perf_counter_ns: int,
+        transformation_name: str,
+        depth_sec: int,
+        depth_nanosec: int,
+        pointcloud_received: bool,
+        color_stamp: tuple[int, int] | None,
+    ) -> int:
+        """Append one transformation publish attempt."""
+        color_sec = color_stamp[0] if color_stamp is not None else None
+        color_nanosec = color_stamp[1] if color_stamp is not None else None
+        color_delta_ns = (
+            self._timestamp_delta_ns(
+                color_stamp,
+                (depth_sec, depth_nanosec),
+            )
+            if color_stamp is not None
+            else None
+        )
+        cursor = self._connection.execute(
+            """
+            INSERT INTO publish_attempts (
+                received_perf_counter_ns,
+                transformation_name,
+                depth_sec,
+                depth_nanosec,
+                pointcloud_received,
+                color_sec,
+                color_nanosec,
+                color_delta_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(received_perf_counter_ns),
+                transformation_name,
+                int(depth_sec),
+                int(depth_nanosec),
+                int(pointcloud_received),
+                color_sec,
+                color_nanosec,
+                color_delta_ns,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def update_publish_attempt_color(
+        self,
+        attempt_id: int,
+        color_stamp: tuple[int, int],
+    ) -> None:
+        """Store the closest observed color timestamp for one attempt."""
+        depth_sec, depth_nanosec = self._connection.execute(
+            """
+            SELECT depth_sec, depth_nanosec
+            FROM publish_attempts
+            WHERE id = ?
+            """,
+            (int(attempt_id),),
+        ).fetchone()
+        self._connection.execute(
+            """
+            UPDATE publish_attempts
+            SET color_sec = ?, color_nanosec = ?, color_delta_ns = ?
+            WHERE id = ?
+            """,
+            (
+                int(color_stamp[0]),
+                int(color_stamp[1]),
+                self._timestamp_delta_ns(
+                    color_stamp,
+                    (depth_sec, depth_nanosec),
+                ),
+                int(attempt_id),
+            ),
+        )
+
+    def mark_publish_attempt_pointcloud_received(self, attempt_id: int) -> None:
+        """Mark that this scanner received the web-selected depth cloud."""
+        self._connection.execute(
+            """
+            UPDATE publish_attempts
+            SET pointcloud_received = 1
+            WHERE id = ?
+            """,
+            (int(attempt_id),),
+        )
+
+    def mark_publish_attempt_captured(
+        self,
+        attempt_id: int,
+        frame_id: int,
+        color_stamp: tuple[int, int],
+    ) -> None:
+        """Link a publish attempt to its recorded synchronized frame."""
+        self.update_publish_attempt_color(attempt_id, color_stamp)
+        self._connection.execute(
+            """
+            UPDATE publish_attempts
+            SET captured_frame_id = ?
+            WHERE id = ?
+            """,
+            (int(frame_id), int(attempt_id)),
+        )
+        self._connection.commit()
+
+    @staticmethod
+    def _timestamp_delta_ns(
+        left: tuple[int, int],
+        right: tuple[int, int],
+    ) -> int:
+        return (
+            (int(left[0]) - int(right[0])) * 1_000_000_000
+            + int(left[1])
+            - int(right[1])
+        )
 
     def commit(self) -> None:
         """Make all appended frames visible to other SQLite connections."""

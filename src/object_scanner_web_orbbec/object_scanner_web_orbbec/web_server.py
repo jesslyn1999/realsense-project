@@ -26,7 +26,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
 from std_srvs.srv import Trigger
 
@@ -41,6 +41,10 @@ POINTCLOUD_TOPIC = "/camera/depth_registered/points"
 TRANSFORM_TOPIC = "/object_scanner_orbbec/camera_to_world"
 TRANSFORM_BURST_COUNT = 1
 TRANSFORM_TIMEOUT_S = 5.0
+TRANSFORM_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+)
 STATUS_SERVICE = "/object_scanner_orbbec/recording_status"
 SERVICE_NAMES = {
     "start": "/object_scanner_orbbec/start_recording",
@@ -117,7 +121,7 @@ class RosControlBridge(Node):
         self._transform_publisher = self.create_publisher(
             NamedTransform,
             TRANSFORM_TOPIC,
-            qos_profile_sensor_data,
+            TRANSFORM_QOS,
         )
         self._pointcloud_subscription = self.create_subscription(
             PointCloud2,

@@ -95,6 +95,9 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
         matrix = np.eye(4)
         matrix[0, 3] = 1.0
         transform = make_transform(stamp, cloud.header.frame_id, matrix)
+        node._on_pointcloud_received(cloud)
+        node._on_color_received(image)
+        node._on_transform_received(transform)
         node._on_synchronized_frame(cloud, image, transform)
 
         response = call(node, node._on_pause_recording)
@@ -118,6 +121,7 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
             [[0, 255, 0]],
         )
 
+        node._on_transform_received(transform)
         assert call(node, node._on_resume_recording).success
         assert node._state is RecordingState.RECORDING
         node._on_synchronized_frame(cloud, image, transform)
@@ -138,7 +142,25 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
             frame_count = connection.execute(
                 "SELECT COUNT(*) FROM frames"
             ).fetchone()[0]
+            publish_attempt = connection.execute(
+                """
+                SELECT transformation_name, depth_sec, depth_nanosec,
+                       pointcloud_received, color_sec, color_nanosec,
+                       color_delta_ns, captured_frame_id
+                FROM publish_attempts
+                """
+            ).fetchone()
         assert frame_count == 2
+        assert publish_attempt == (
+            "identity",
+            1,
+            2,
+            1,
+            1,
+            2,
+            0,
+            1,
+        )
         metadata = json.loads(
             (database_path.parent / "metadata.json").read_text(
                 encoding="utf-8"
@@ -167,6 +189,96 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
             assert connection.execute(
                 "SELECT COUNT(*) FROM frames"
             ).fetchone()[0] == 2
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_do_check_replaces_previous_session_and_logs_stream_timestamps(
+    tmp_path,
+):
+    session_directory = tmp_path / "do_check"
+    session_directory.mkdir()
+    stale_file = session_directory / "stale.txt"
+    stale_file.write_text("old diagnostic", encoding="utf-8")
+
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p",
+            f"output_directory:={tmp_path}",
+            "-p",
+            "session_name:=do_check",
+        ]
+    )
+    node = OrbbecObjectScannerNode()
+    try:
+        response = call(node, node._on_start_recording)
+        assert response.success
+        assert not stale_file.exists()
+        database_path = node._database_path
+
+        cloud_stamp = PointCloud2().header.stamp
+        cloud_stamp.sec = 30
+        cloud_stamp.nanosec = 100_000_000
+        color_stamp = Image().header.stamp
+        color_stamp.sec = 29
+        color_stamp.nanosec = 900_000_000
+        transform_stamp = NamedTransform().header.stamp
+        transform_stamp.sec = 30
+        transform_stamp.nanosec = 100_000_000
+
+        node._on_pointcloud_received(make_cloud([], cloud_stamp))
+        color = Image()
+        color.header.stamp = color_stamp
+        node._on_color_received(color)
+        transform = make_transform(
+            transform_stamp,
+            "camera_color_optical_frame",
+            np.eye(4),
+        )
+        node._on_transform_received(transform)
+        next_color = Image()
+        next_color.header.stamp.sec = 30
+        next_color.header.stamp.nanosec = 150_000_000
+        node._on_color_received(next_color)
+
+        assert call(node, node._on_stop_recording).success
+        with closing(sqlite3.connect(database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT stream, source_sec, source_nanosec,
+                       arrival_perf_counter_ns
+                FROM stream_timestamps
+                ORDER BY id
+                """
+            ).fetchall()
+            publish_attempt = connection.execute(
+                """
+                SELECT transformation_name, depth_sec, depth_nanosec,
+                       pointcloud_received, color_sec, color_nanosec,
+                       color_delta_ns, captured_frame_id
+                FROM publish_attempts
+                """
+            ).fetchone()
+        assert [(stream, sec, nanosec) for stream, sec, nanosec, _ in rows] == [
+            ("pointcloud", 30, 100_000_000),
+            ("color_image", 29, 900_000_000),
+            ("transformation", 30, 100_000_000),
+            ("color_image", 30, 150_000_000),
+        ]
+        assert all(arrival > 0 for _, _, _, arrival in rows)
+        assert publish_attempt == (
+            "identity",
+            30,
+            100_000_000,
+            1,
+            30,
+            150_000_000,
+            50_000_000,
+            None,
+        )
     finally:
         node.shutdown()
         node.destroy_node()

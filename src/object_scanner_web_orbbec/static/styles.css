@@ -548,6 +548,27 @@ h2 {
     );
 }
 
+.orientation-gizmo {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 3;
+  width: 104px;
+  height: 104px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-translucent);
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+}
+
+.orientation-gizmo canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .point-coordinate-tooltip {
   position: absolute;
   z-index: 4;

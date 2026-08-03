@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "session_name": "cup2",
+  "database_file": "recording.sqlite3",
+  "frames": [
+    {
+      "sqlite_frame_id": 1,
+      "source_sec": 1785742104,
+      "source_nanosec": 118156032,
+      "transformation_name": "left",
+      "parent_frame_id": "world",
+      "matrix": [
+        [
+          0.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    }
+  ]
+}

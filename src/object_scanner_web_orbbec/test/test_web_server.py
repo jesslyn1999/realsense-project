@@ -160,6 +160,7 @@ def test_flask_controls_and_serves_paused_points(tmp_path):
         assert b'id="replay-next-button"' in page.data
         assert b'id="replay-exit-button"' in page.data
         assert b'id="camera-overlay-checkbox"' in page.data
+        assert b'id="orientation-gizmo"' in page.data
         assert b'id="point-coordinate-tooltip"' in page.data
         assert client.get("/static/app.js").status_code == 200
         status = client.get("/api/status").json
