@@ -1,97 +1,94 @@
-# RealSense ROS 2 workspace
+# Physical AI Repair Scanner
 
-This workspace launches one RealSense D435i as an RGB-D camera on ROS 2 Jazzy.
-It includes the required RealSense ROS 4.58.3 source packages so it can build
-without the sibling `realsense-ros` repository.
+> Built for the **Physical AI Hackathon 2026**
 
-## Camera configuration
+**Physical AI · RGB-D Computer Vision · 3D Reconstruction · Point Clouds ·
+Digital Twins · Human-in-the-Loop AI · Smart Manufacturing**
 
-The default config is
-`src/realsense_camera_ros/config/camera_d435i.json`. It selects the first
-connected device whose reported name contains `D435I` and enables synchronized
-1280x720 color plus 848x480 depth and infrared streams at 30 FPS.
+This project is an intelligent object scanner for the reconstruction and repair
+domain. It uses an Intel RealSense D435-series RGB-D camera to capture damaged
+objects from multiple viewpoints, reconstruct their geometry, and identify the
+region that needs to be filled or repaired.
 
-If multiple D435i cameras are connected, device ordering is not guaranteed.
-Add a `serial_no` parameter to the JSON when deterministic selection is needed.
+A ChArUco board gives every capture a shared world coordinate frame. The
+platform combines color-guided object detection, multi-view point-cloud
+reconstruction, automatic repair segmentation, and manual repair alignment in
+one browser-based workflow.
 
-## Build
+## Project concept
+
+![Pipe STL geometry comparison](resources/describe.png)
+
+The example above compares a broken pipe with its segmented repair surface. The
+orange geometry represents the area that can be filled to reconstruct the
+damaged part.
+
+## Demo
+
+![Physical AI Repair Scanner demo](resources/demo.gif)
+
+## Features
+
+1. **Color-guided object detection** — the RealSense D435 captures synchronized
+   RGB and depth data and keeps points that match a predefined reference color.
+2. **Session-based scanning** — the user starts a named recording session and
+   clicks **Capture** to add each RGB-D observation.
+3. **ChArUco world coordinates** — a printable board is provided in
+   [`src/board_resources/ChArUco`](src/board_resources/ChArUco). The board and
+   object must both be visible during capture. At least 20 ChArUco corners must
+   be detected before a frame is accepted.
+4. **Live reconstruction preview** — pausing or stopping a recording processes
+   the accepted captures and previews the reconstructed point cloud collected
+   so far.
+5. **Repair analysis and adjustment** — automatic segmentation extracts the
+   proposed repair region, while **Adjust repair** lets the user manually place
+   and align the repair part on the reconstructed object.
+
+## Workflow
+
+1. Print the ChArUco board at **100% / Actual size**.
+2. Place the target object beside the board and keep both visible to the camera.
+3. Select the object's reference color and start a recording session.
+4. Move the camera around the object and click **Capture** at each viewpoint.
+5. Pause or stop the session to inspect the fused 3D reconstruction.
+6. Run **Analyze** to segment the missing region, then use **Adjust repair** for
+   human-in-the-loop placement.
+
+## Technology stack
+
+- **ROS 2 Jazzy** for camera, transformation, and recording services
+- **Intel RealSense D435-series** RGB-D sensing and colored point clouds
+- **OpenCV ChArUco** for camera pose estimation and spatial registration
+- **Open3D** for point-cloud cleaning, alignment, fusion, and reconstruction
+- **Flask + Three.js** for the interactive 3D web interface
+- **SQLite** for reproducible per-session scan storage
+
+## Build and run
+
+Requirements: Ubuntu with ROS 2 Jazzy, librealsense 2.58 or newer, an Intel
+RealSense D435-series camera, and Python 3.12.
 
 ```bash
+sudo apt install python3.12-venv
+python3 -m venv --system-site-packages .venv_scanner
+source .venv_scanner/bin/activate
+python -m pip install open3d-cpu==0.19.0 "scipy>=1.15.0" \
+  "scikit-learn>=1.6.0"
+
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install \
-  --packages-select realsense2_camera_msgs realsense2_camera realsense_camera_ros \
-  object_scanner_interfaces object_scanner object_scanner_web \
-  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Debug
+  --packages-select realsense2_camera_msgs realsense2_camera \
+  realsense_camera_ros object_scanner_interfaces object_scanner \
+  object_scanner_processing object_scanner_web \
+  --cmake-args -DPython3_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_BUILD_TYPE=Debug
+ln -sf build/compile_commands.json compile_commands.json
 source install/setup.bash
-```
-
-The machine must provide librealsense 2.58 or newer and the ROS dependencies
-declared by the three packages.
-
-## Launch
-
-Use the installed default config:
-
-```bash
-ros2 launch realsense_camera_ros realsense_camera.launch.py
-```
-
-Launch the camera and the point-cloud RViz layout with color, depth, and both
-infrared streams:
-
-```bash
-ros2 launch realsense_camera_ros realsense_camera_rviz.launch.py
-```
-
-Or provide another JSON config. `config` is the launch file's only argument:
-
-```bash
-ros2 launch realsense_camera_ros realsense_camera.launch.py \
-  config:=src/realsense_camera_ros/config/camera_d435i.json
-```
-
-Primary topics:
-
-- `/realsense/camera0/color/image_raw`
-- `/realsense/camera0/color/camera_info`
-- `/realsense/camera0/depth/image_rect_raw`
-- `/realsense/camera0/depth/camera_info`
-- `/realsense/camera0/depth/color/points`
-- `/realsense/camera0/infra1/image_rect_raw`
-- `/realsense/camera0/infra2/image_rect_raw`
-
-## Object scanning
-
-`object_scanner` filters colored points, applies a named camera-to-world
-transformation, and stores each session under `scans/<session_name>/` as
-`recording.sqlite3` plus per-frame transformation metadata.
-
-```bash
 ros2 launch object_scanner_web object_scanner_web.launch.py
 ```
 
-See `src/object_scanner/README.md` for output files and parameters.
+Open [http://localhost:5000](http://localhost:5000) to use the scanner.
 
-## Orbbec DaBai DC1 scanning
-
-The isolated Orbbec scanner uses the first detected DaBai DC1 and does not
-modify or launch the RealSense scanner packages.
-
-```bash
-source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install \
-  --packages-select orbbec_camera_msgs orbbec_camera \
-  object_scanner_interfaces object_scanner_processing \
-  object_scanner_web_orbbec \
-  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Debug
-source install/setup.bash
-ros2 launch object_scanner_web_orbbec object_scanner_web.launch.py
-```
-
-The web interface is available on port 5000. The scanner consumes
-`/camera/color/image_raw` and `/camera/depth_registered/points`.
-
-Upstream source provenance and license notices are under `src/realsense-ros/`
-and `src/orbbec-ros/`.
+Each session is saved under `scans/<session_name>/` with the raw capture,
+aligned reconstruction, and transformation metadata.
