@@ -1,12 +1,35 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
 
 const viewer = document.querySelector("#viewer");
 const placeholder = document.querySelector("#viewer-placeholder");
+const remoteLoadingOverlay = document.querySelector("#remote-loading-overlay");
 const orientationGizmo = document.querySelector("#orientation-gizmo");
 const pointCoordinateTooltip = document.querySelector(
   "#point-coordinate-tooltip",
 );
+const analyzeButton = document.querySelector("#analyze-button");
+const adjustRepairButton = document.querySelector("#adjust-repair-button");
+const analysisDock = document.querySelector("#analysis-dock");
+const analysisStatus = document.querySelector("#analysis-status");
+const analysisEditControls = document.querySelector("#analysis-edit-controls");
+const analysisRepairVisible = document.querySelector(
+  "#analysis-repair-visible",
+);
+const analysisSegmentVisible = document.querySelector(
+  "#analysis-segment-visible",
+);
+const analysisApplyButton = document.querySelector("#analysis-apply-button");
+const analysisSaveButton = document.querySelector("#analysis-save-button");
+const analysisCancelButton = document.querySelector("#analysis-cancel-button");
+const analysisResetButton = document.querySelector("#analysis-reset-button");
+const analysisModeButtons = {
+  translate: document.querySelector("#analysis-move-button"),
+  rotate: document.querySelector("#analysis-rotate-button"),
+  scale: document.querySelector("#analysis-scale-button"),
+};
 const scanHelpButton = document.querySelector("#scan-help-button");
 const scanHelpDialog = document.querySelector("#scan-help-dialog");
 const closeScanHelpButton = document.querySelector(
@@ -102,6 +125,7 @@ const commandButtons = {
 const SESSION_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const THEME_STORAGE_KEY = "object-scanner-theme";
 const MAX_REPLAY_POINTS = 250_000;
+const REPAIR_SESSION = "demo5";
 const REPLAY_STAGE_LABELS = {
   raw: "Raw",
   filtered: "Outliers removed",
@@ -110,6 +134,7 @@ const REPLAY_STAGE_LABELS = {
 const POINT_PICK_THRESHOLD_M = 0.008;
 const POINT_TOOLTIP_OFFSET_PX = 12;
 const CHARUCO_PREVIEW_INTERVAL_MS = 200;
+const REMOTE_CONTROL_INTERVAL_MS = 300;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1000);
@@ -185,6 +210,13 @@ for (const [label, direction, color, cssColor] of gizmoAxes) {
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
+const repairTransformControls = new TransformControls(
+  camera,
+  renderer.domElement,
+);
+const repairTransformHelper = repairTransformControls.getHelper();
+repairTransformHelper.visible = false;
+scene.add(repairTransformHelper);
 const pointRaycaster = new THREE.Raycaster();
 pointRaycaster.params.Points.threshold = POINT_PICK_THRESHOLD_M;
 const pointPointer = new THREE.Vector2();
@@ -217,6 +249,15 @@ let replayCameraOverlay = null;
 let replayStage = "raw";
 let replayAvailableStages = new Set(["raw"]);
 let replayStageLoading = false;
+let analysisBusy = false;
+let repairPointCloud = null;
+let repairMesh = null;
+let repairInitialTransform = null;
+let repairTransform = null;
+let repairEditing = false;
+let remoteLoadingVisible = false;
+let remoteCommandRunning = false;
+let remoteControlInitialized = false;
 let pendingPointHover = null;
 let charucoPreviewGeneration = 0;
 let charucoPreviewRunning = false;
@@ -239,6 +280,11 @@ function resetView() {
 function setMessage(text, isError = false) {
   message.textContent = text;
   message.classList.toggle("error", isError);
+}
+
+function setRemoteLoadingVisible(visible) {
+  remoteLoadingVisible = visible;
+  remoteLoadingOverlay.hidden = !visible;
 }
 
 function setTheme(theme, persist = false) {
@@ -327,8 +373,14 @@ function isSessionNameValid() {
   return SESSION_NAME_PATTERN.test(sessionNameInput.value);
 }
 
+function hasRepairSession() {
+  return Array.from(savedSessionSelect.options).some(
+    (option) => option.value === REPAIR_SESSION,
+  );
+}
+
 function updateControls(busy = false) {
-  busy = busy || replayStageLoading;
+  busy = busy || replayStageLoading || analysisBusy;
   commandButtons.start.disabled =
     busy || currentState !== "stopped" || !isSessionNameValid();
   commandButtons.pause.disabled = busy || currentState !== "recording";
@@ -366,6 +418,24 @@ function updateControls(busy = false) {
       busy || !replayMode || !replayAvailableStages.has(stage);
     button.setAttribute("aria-pressed", String(stage === replayStage));
   }
+  analyzeButton.disabled =
+    busy ||
+    currentState !== "stopped" ||
+    !hasRepairSession();
+  adjustRepairButton.disabled =
+    busy || currentState !== "stopped" || repairTransform === null;
+  const analysisDisabled = busy || repairMesh === null;
+  analysisApplyButton.disabled = analysisDisabled;
+  analysisSaveButton.disabled = analysisDisabled;
+  analysisCancelButton.disabled = analysisDisabled;
+  analysisResetButton.disabled =
+    analysisDisabled || repairInitialTransform === null;
+  for (const button of Object.values(analysisModeButtons)) {
+    button.disabled = analysisDisabled;
+  }
+  analysisRepairVisible.disabled =
+    busy || repairMesh === null || repairEditing;
+  analysisSegmentVisible.disabled = busy || repairPointCloud === null;
 }
 
 function applyStatus(status) {
@@ -416,6 +486,66 @@ function disposeCloud(cloud) {
   cloud.material.dispose();
 }
 
+function setAnalysisMode(mode) {
+  repairTransformControls.setMode(mode);
+  for (const [buttonMode, button] of Object.entries(analysisModeButtons)) {
+    button.setAttribute("aria-pressed", String(buttonMode === mode));
+  }
+}
+
+function matrixFromRows(rows) {
+  if (
+    !Array.isArray(rows) ||
+    rows.length !== 4 ||
+    rows.some((row) => !Array.isArray(row) || row.length !== 4)
+  ) {
+    throw new Error("Repair analysis returned an invalid transform");
+  }
+  return new THREE.Matrix4().set(...rows.flat());
+}
+
+function repairMatrixRows() {
+  repairMesh.updateMatrix();
+  const elements = repairMesh.matrix.elements;
+  return [
+    [elements[0], elements[4], elements[8], elements[12]],
+    [elements[1], elements[5], elements[9], elements[13]],
+    [elements[2], elements[6], elements[10], elements[14]],
+    [elements[3], elements[7], elements[11], elements[15]],
+  ];
+}
+
+function hideRepairEditor() {
+  repairTransformControls.detach();
+  repairTransformHelper.visible = false;
+  controls.enabled = true;
+  repairEditing = false;
+  analysisEditControls.hidden = true;
+  if (repairMesh !== null) {
+    repairMesh.visible = analysisRepairVisible.checked;
+  }
+  updateControls();
+}
+
+function clearRepairAnalysis() {
+  hideRepairEditor();
+  if (repairPointCloud !== null) {
+    disposeCloud(repairPointCloud);
+    repairPointCloud = null;
+  }
+  if (repairMesh !== null) {
+    scene.remove(repairMesh);
+    repairMesh.geometry.dispose();
+    repairMesh.material.dispose();
+    repairMesh = null;
+  }
+  repairInitialTransform = null;
+  repairTransform = null;
+  analysisRepairVisible.checked = false;
+  analysisSegmentVisible.checked = true;
+  analysisDock.hidden = true;
+}
+
 function clearReplayClouds() {
   for (const replayCloud of replayClouds) {
     if (replayCloud.cloud !== null) {
@@ -428,6 +558,7 @@ function clearReplayClouds() {
 }
 
 function clearPointCloud() {
+  clearRepairAnalysis();
   if (pointCloud !== null) {
     disposeCloud(pointCloud);
     pointCloud = null;
@@ -440,12 +571,16 @@ function clearPointCloud() {
 }
 
 function visiblePointClouds() {
-  if (pointCloud !== null) {
-    return [pointCloud];
+  const clouds =
+    pointCloud !== null
+      ? [pointCloud]
+      : replayClouds
+          .map((replayCloud) => replayCloud.cloud)
+          .filter((cloud) => cloud !== null);
+  if (repairPointCloud !== null) {
+    clouds.push(repairPointCloud);
   }
-  return replayClouds
-    .map((replayCloud) => replayCloud.cloud)
-    .filter((cloud) => cloud !== null);
+  return clouds;
 }
 
 function hidePointTooltip() {
@@ -727,6 +862,7 @@ async function loadPoints() {
 }
 
 function resetReplay(clearSelection = true) {
+  clearRepairAnalysis();
   replayGeneration += 1;
   replayMode = false;
   replayFrames = [];
@@ -854,12 +990,15 @@ async function addReplayFrame(index, generation = replayGeneration) {
   return true;
 }
 
-async function loadReplaySession() {
-  const sessionName = savedSessionSelect.value;
+async function loadReplaySession(
+  sessionName = savedSessionSelect.value,
+  preferredStage = "raw",
+) {
+  savedSessionSelect.value = sessionName;
   resetReplay(false);
   clearPointCloud();
   if (!sessionName) {
-    return;
+    return false;
   }
 
   const generation = replayGeneration;
@@ -874,26 +1013,33 @@ async function loadReplaySession() {
       throw new Error(result.message || "Cannot load replay");
     }
     if (generation !== replayGeneration) {
-      return;
+      return false;
     }
     replayFrames = result.frames;
     replayAvailableStages = new Set(result.stages || ["raw"]);
     if (replayFrames.length === 0) {
       setMessage(`Replay '${sessionName}' has no recorded frames.`);
-      return;
+      return false;
     }
+    replayStage = replayAvailableStages.has(preferredStage)
+      ? preferredStage
+      : "raw";
     replayMode = true;
     replaySessionName.textContent = sessionName;
     replayDock.hidden = false;
-    await addReplayFrame(0, generation);
+    if (!(await addReplayFrame(0, generation))) {
+      return false;
+    }
     setMessage(
       `Replay '${sessionName}' is ready. Use Next to add another frame.`,
     );
+    return true;
   } catch (error) {
     if (generation === replayGeneration) {
       resetReplay(false);
       setMessage(error.message, true);
     }
+    return false;
   } finally {
     updateControls();
   }
@@ -909,6 +1055,7 @@ async function setReplayStage(stage) {
     return;
   }
 
+  clearRepairAnalysis();
   const lastIndex = replayIndex;
   replayGeneration += 1;
   const generation = replayGeneration;
@@ -936,9 +1083,220 @@ async function setReplayStage(stage) {
   }
 }
 
+function setRepairPointOverlay(points) {
+  if (
+    !Array.isArray(points) ||
+    points.length % 3 !== 0 ||
+    points.some((value) => !Number.isFinite(value))
+  ) {
+    throw new Error("Repair analysis returned invalid points");
+  }
+  if (repairPointCloud !== null) {
+    disposeCloud(repairPointCloud);
+    repairPointCloud = null;
+  }
+  if (points.length === 0) {
+    return;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(points), 3),
+  );
+  const material = new THREE.PointsMaterial({
+    color: 0xff5b35,
+    size: 0.007,
+    sizeAttenuation: true,
+    depthTest: false,
+  });
+  repairPointCloud = new THREE.Points(geometry, material);
+  repairPointCloud.renderOrder = 2;
+  repairPointCloud.visible = analysisSegmentVisible.checked;
+  scene.add(repairPointCloud);
+}
+
+async function loadRepairMesh() {
+  if (repairMesh !== null) {
+    return;
+  }
+  const geometry = await new STLLoader().loadAsync("/api/repair/reference");
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xff8a3d,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.78,
+  });
+  repairMesh = new THREE.Mesh(geometry, material);
+  repairMesh.visible = false;
+  scene.add(repairMesh);
+}
+
+function applyRepairMeshTransform(transform) {
+  matrixFromRows(transform).decompose(
+    repairMesh.position,
+    repairMesh.quaternion,
+    repairMesh.scale,
+  );
+  repairMesh.updateMatrixWorld(true);
+}
+
+async function placeRepairMesh(transform) {
+  await loadRepairMesh();
+  applyRepairMeshTransform(transform);
+}
+
+async function showRepairEditor(transform) {
+  await placeRepairMesh(transform);
+  repairEditing = true;
+  repairMesh.visible = true;
+  repairTransformControls.attach(repairMesh);
+  repairTransformHelper.visible = true;
+  setAnalysisMode("translate");
+  analysisDock.hidden = false;
+  analysisEditControls.hidden = false;
+  analysisStatus.textContent =
+    "Move, rotate, or uniformly scale the repair, then apply.";
+  updateControls();
+}
+
+async function requestRepairAnalysis(transform, save = false) {
+  const sessionName = savedSessionSelect.value;
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionName)}/repair-analysis`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transform, save }),
+    },
+  );
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.message || "Cannot analyze the repair region");
+  }
+  matrixFromRows(result.transform);
+  if (!Number.isInteger(result.point_count)) {
+    throw new Error("Repair analysis returned an invalid point count");
+  }
+  return result;
+}
+
+async function analyzeRepair() {
+  analysisBusy = true;
+  updateControls();
+  setMessage("Loading demo5 and its original repair segmentation…");
+  try {
+    if (!replayMode || savedSessionSelect.value !== REPAIR_SESSION) {
+      if (!(await loadReplaySession(REPAIR_SESSION, "aligned"))) {
+        throw new Error(`Cannot load replay '${REPAIR_SESSION}'.`);
+      }
+    } else if (replayStage !== "aligned") {
+      await setReplayStage("aligned");
+    }
+    if (!replayAvailableStages.has("aligned")) {
+      throw new Error("demo5 has no aligned recording for repair analysis");
+    }
+
+    const result = await requestRepairAnalysis(null);
+    analysisRepairVisible.checked = false;
+    analysisSegmentVisible.checked = true;
+    setRepairPointOverlay(result.points);
+    repairInitialTransform = result.transform.map((row) => [...row]);
+    repairTransform = result.transform.map((row) => [...row]);
+    await placeRepairMesh(repairTransform);
+    repairMesh.visible = false;
+    repairEditing = false;
+    analysisEditControls.hidden = true;
+    analysisDock.hidden = false;
+    const placementLabel =
+      result.placement_source === "saved" ? "saved" : "original";
+    analysisStatus.textContent =
+      `${result.point_count.toLocaleString()} ${placementLabel} ` +
+      "repair-region points.";
+    setMessage(
+      `Showing ${result.point_count.toLocaleString()} ${placementLabel} ` +
+        "segmented repair-region points.",
+    );
+  } catch (error) {
+    clearRepairAnalysis();
+    setMessage(error.message, true);
+  } finally {
+    analysisBusy = false;
+    updateControls();
+  }
+}
+
+async function adjustRepair() {
+  if (repairTransform === null) {
+    return;
+  }
+  await showRepairEditor(repairTransform);
+}
+
+async function updateRepairPlacement(save) {
+  if (repairMesh === null) {
+    return;
+  }
+  analysisBusy = true;
+  updateControls();
+  setMessage(
+    save
+      ? "Applying and saving the current repair placement…"
+      : "Updating the repair segmentation from the adjusted placement…",
+  );
+  try {
+    const result = await requestRepairAnalysis(repairMatrixRows(), save);
+    setRepairPointOverlay(result.points);
+    repairTransform = result.transform.map((row) => [...row]);
+    hideRepairEditor();
+    analysisStatus.textContent =
+      `${result.point_count.toLocaleString()} ` +
+      `${save ? "saved" : "adjusted"} repair-region points.`;
+    setMessage(
+      save
+        ? `Repair placement saved in scans/${REPAIR_SESSION}/` +
+            "repair_placement.json."
+        : `Repair placement applied; ` +
+            `${result.point_count.toLocaleString()} scan points selected.`,
+    );
+  } catch (error) {
+    setMessage(error.message, true);
+  } finally {
+    analysisBusy = false;
+    updateControls();
+  }
+}
+
+function applyRepairPlacement() {
+  return updateRepairPlacement(false);
+}
+
+function saveRepairPlacement() {
+  return updateRepairPlacement(true);
+}
+
+function resetRepairPlacement() {
+  if (repairMesh === null || repairInitialTransform === null) {
+    return;
+  }
+  applyRepairMeshTransform(repairInitialTransform);
+}
+
+async function cancelRepairAdjustment() {
+  if (repairTransform !== null) {
+    await placeRepairMesh(repairTransform);
+  }
+  hideRepairEditor();
+  if (repairPointCloud !== null) {
+    analysisStatus.textContent =
+      `${repairPointCloud.geometry.attributes.position.count.toLocaleString()} ` +
+      "repair-region points.";
+  }
+}
+
 async function nextReplayFrame() {
   if (!replayMode || replayIndex >= replayFrames.length - 1) {
-    return;
+    return false;
   }
   updateControls(true);
   try {
@@ -947,9 +1305,12 @@ async function nextReplayFrame() {
       setMessage(
         `Added frame ${nextIndex + 1} of ${replayFrames.length} to the replay.`,
       );
+      return true;
     }
+    return false;
   } catch (error) {
     setMessage(error.message, true);
+    return false;
   } finally {
     updateControls();
   }
@@ -1446,8 +1807,173 @@ async function loadStatus() {
   }
 }
 
+function remoteViewerReport(
+  completedCommandId = null,
+  commandError = null,
+  commandBusy = remoteCommandRunning,
+) {
+  const report = {
+    replay_mode: replayMode,
+    replay_index: replayIndex,
+    replay_total: replayFrames.length,
+    can_next:
+      replayMode &&
+      !replayStageLoading &&
+      replayIndex < replayFrames.length - 1,
+    loading_visible: remoteLoadingVisible,
+    busy: replayStageLoading || commandBusy,
+    stage: replayStage,
+  };
+  if (completedCommandId !== null) {
+    report.completed_command_id = completedCommandId;
+    report.error = commandError;
+  }
+  return report;
+}
+
+async function reportRemoteViewer(
+  completedCommandId = null,
+  commandError = null,
+  commandBusy = remoteCommandRunning,
+) {
+  const response = await fetch("/api/remote/viewer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(
+      remoteViewerReport(completedCommandId, commandError, commandBusy),
+    ),
+  });
+  if (!response.ok) {
+    const result = await response.json();
+    throw new Error(result.message || "Cannot report remote viewer state");
+  }
+}
+
+async function executeRemoteCommand(command, demoSession) {
+  switch (command) {
+    case "start_replay": {
+      const preferredStage = replayMode ? replayStage : "raw";
+      if (!(await loadReplaySession(demoSession, preferredStage))) {
+        throw new Error(`Cannot start replay '${demoSession}'.`);
+      }
+      break;
+    }
+    case "next":
+      if (!(await nextReplayFrame())) {
+        throw new Error("There is no next replay frame.");
+      }
+      break;
+    case "show_loading":
+      setRemoteLoadingVisible(true);
+      break;
+    case "stop_loading":
+      setRemoteLoadingVisible(false);
+      break;
+    default:
+      throw new Error(`Unsupported remote command '${command}'.`);
+  }
+}
+
+async function pollRemoteControl() {
+  if (remoteCommandRunning) {
+    return;
+  }
+
+  let result;
+  try {
+    const response = await fetch("/api/remote/command", {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      return;
+    }
+    result = await response.json();
+  } catch {
+    return;
+  }
+
+  if (!remoteControlInitialized) {
+    setRemoteLoadingVisible(Boolean(result.loading_visible));
+    remoteControlInitialized = true;
+  }
+
+  if (result.command === null) {
+    reportRemoteViewer().catch(() => {});
+    return;
+  }
+
+  remoteCommandRunning = true;
+  reportRemoteViewer().catch(() => {});
+  let commandError = null;
+  try {
+    await executeRemoteCommand(
+      result.command.command,
+      result.demo_session,
+    );
+  } catch (error) {
+    commandError = error.message;
+    setMessage(commandError, true);
+  }
+
+  try {
+    await reportRemoteViewer(
+      result.command.id,
+      commandError,
+      false,
+    );
+  } catch {
+    // Keep the main viewer usable if the remote status endpoint is unavailable.
+  } finally {
+    remoteCommandRunning = false;
+  }
+}
+
+repairTransformControls.addEventListener("dragging-changed", (event) => {
+  controls.enabled = !event.value;
+});
+repairTransformControls.addEventListener("objectChange", () => {
+  if (
+    repairMesh === null ||
+    repairTransformControls.getMode() !== "scale"
+  ) {
+    return;
+  }
+  const uniformScale = Math.max(
+    Math.cbrt(
+      Math.abs(repairMesh.scale.x * repairMesh.scale.y * repairMesh.scale.z),
+    ),
+    1e-6,
+  );
+  repairMesh.scale.setScalar(uniformScale);
+});
+
 for (const [command, button] of Object.entries(commandButtons)) {
   button.addEventListener("click", () => sendCommand(command));
+}
+analyzeButton.addEventListener("click", () => {
+  analyzeRepair().catch((error) => setMessage(error.message, true));
+});
+adjustRepairButton.addEventListener("click", () => {
+  adjustRepair().catch((error) => setMessage(error.message, true));
+});
+analysisApplyButton.addEventListener("click", applyRepairPlacement);
+analysisSaveButton.addEventListener("click", saveRepairPlacement);
+analysisCancelButton.addEventListener("click", () => {
+  cancelRepairAdjustment().catch((error) => setMessage(error.message, true));
+});
+analysisResetButton.addEventListener("click", resetRepairPlacement);
+analysisRepairVisible.addEventListener("change", () => {
+  if (repairMesh !== null && !repairEditing) {
+    repairMesh.visible = analysisRepairVisible.checked;
+  }
+});
+analysisSegmentVisible.addEventListener("change", () => {
+  if (repairPointCloud !== null) {
+    repairPointCloud.visible = analysisSegmentVisible.checked;
+  }
+});
+for (const [mode, button] of Object.entries(analysisModeButtons)) {
+  button.addEventListener("click", () => setAnalysisMode(mode));
 }
 scanHelpButton.addEventListener("click", () => scanHelpDialog.showModal());
 closeScanHelpButton.addEventListener("click", () => scanHelpDialog.close());
@@ -1467,7 +1993,7 @@ previousTransformationButton.addEventListener("click", () =>
 nextTransformationButton.addEventListener("click", () =>
   stepTransformation(1),
 );
-savedSessionSelect.addEventListener("change", loadReplaySession);
+savedSessionSelect.addEventListener("change", () => loadReplaySession());
 replayPreviousButton.addEventListener("click", previousReplayFrame);
 replayNextButton.addEventListener("click", nextReplayFrame);
 replayExitButton.addEventListener("click", () => {
@@ -1567,4 +2093,7 @@ setTheme(document.documentElement.dataset.theme);
 showTransformationMode();
 resetView();
 animate();
-loadStatus();
+loadStatus().then(() => {
+  pollRemoteControl();
+  window.setInterval(pollRemoteControl, REMOTE_CONTROL_INTERVAL_MS);
+});

@@ -6,6 +6,40 @@
     {
       "sqlite_frame_id": 1,
       "source_sec": 1785833036,
+      "source_nanosec": 555012694,
+      "transformation_name": "charuco",
+      "parent_frame_id": "world",
+      "matrix": [
+        [
+          -0.9280592108302335,
+          -0.04039452320834046,
+          -0.3702355786360016,
+          0.23869068646120442
+        ],
+        [
+          0.22676445090104608,
+          0.7272991641675821,
+          -0.6477760489618951,
+          0.09531657138200555
+        ],
+        [
+          0.29543863153066346,
+          -0.685130796487727,
+          -0.6658166464601061,
+          0.2417465920061223
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "synthetic_empty_frame": true
+    },
+    {
+      "sqlite_frame_id": 2,
+      "source_sec": 1785833036,
       "source_nanosec": 555012695,
       "transformation_name": "charuco",
       "parent_frame_id": "world",
@@ -38,7 +72,7 @@
       "source_demo4_frame_id": 1
     },
     {
-      "sqlite_frame_id": 2,
+      "sqlite_frame_id": 3,
       "source_sec": 1785833052,
       "source_nanosec": 433088623,
       "transformation_name": "charuco",
@@ -72,7 +106,7 @@
       "source_demo4_frame_id": 2
     },
     {
-      "sqlite_frame_id": 3,
+      "sqlite_frame_id": 4,
       "source_sec": 1785833068,
       "source_nanosec": 444641357,
       "transformation_name": "charuco",
@@ -106,7 +140,7 @@
       "source_demo4_frame_id": 3
     },
     {
-      "sqlite_frame_id": 4,
+      "sqlite_frame_id": 5,
       "source_sec": 1785833073,
       "source_nanosec": 147968506,
       "transformation_name": "charuco",
@@ -140,7 +174,7 @@
       "source_demo4_frame_id": 4
     },
     {
-      "sqlite_frame_id": 5,
+      "sqlite_frame_id": 6,
       "source_sec": 1785833117,
       "source_nanosec": 12845947,
       "transformation_name": "charuco",
@@ -174,7 +208,7 @@
       "source_demo4_frame_id": 5
     },
     {
-      "sqlite_frame_id": 6,
+      "sqlite_frame_id": 7,
       "source_sec": 1785833182,
       "source_nanosec": 359727295,
       "transformation_name": "charuco",
@@ -208,7 +242,7 @@
       "source_demo4_frame_id": 9
     },
     {
-      "sqlite_frame_id": 7,
+      "sqlite_frame_id": 8,
       "source_sec": 1785833186,
       "source_nanosec": 696228271,
       "transformation_name": "charuco",
@@ -242,7 +276,7 @@
       "source_demo4_frame_id": 10
     },
     {
-      "sqlite_frame_id": 8,
+      "sqlite_frame_id": 9,
       "source_sec": 1785833203,
       "source_nanosec": 541675293,
       "transformation_name": "charuco",
@@ -276,7 +310,7 @@
       "source_demo4_frame_id": 12
     },
     {
-      "sqlite_frame_id": 9,
+      "sqlite_frame_id": 10,
       "source_sec": 1785833208,
       "source_nanosec": 946625488,
       "transformation_name": "charuco",
@@ -312,9 +346,9 @@
   ],
   "derived_from": "demo4",
   "replay_processing": {
-    "raw": "nine selected demo4 raw frames, point data unchanged and IDs renumbered 1-9",
-    "filtered": "ChArUco depth correction; remove world Z <= 0.002 m; largest DBSCAN component; spatial and temporal outlier filtering",
-    "aligned": "regenerated using only the nine selected frames"
+    "raw": "one leading empty replay frame followed by nine selected demo4 raw frames; source frame point data unchanged and IDs renumbered 2-10",
+    "filtered": "leading empty replay frame; ChArUco depth correction; remove world Z <= 0.002 m; largest DBSCAN component; spatial and temporal outlier filtering",
+    "aligned": "one leading empty replay frame followed by aligned output for the nine selected frames"
   },
   "selected_demo4_frame_ids": [
     1,
