@@ -211,6 +211,14 @@
       </aside>
 
       <section id="viewer" class="viewer" aria-label="3D point-cloud viewer">
+        <button
+          id="scan-help-button"
+          class="viewer-help-button"
+          type="button"
+          aria-label="Show capture workflow"
+          aria-haspopup="dialog"
+          title="Capture workflow"
+        >!</button>
         <div
           id="orientation-gizmo"
           class="orientation-gizmo"
@@ -244,6 +252,67 @@
         </div>
       </section>
     </main>
+
+    <dialog id="scan-help-dialog" class="camera-dialog scan-help-dialog">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">Capture guide</p>
+          <h2>Best ChArUco scanning workflow</h2>
+        </div>
+        <button
+          id="close-scan-help-button"
+          class="icon-button"
+          aria-label="Close capture guide"
+        >×</button>
+      </div>
+      <div class="scan-help-content">
+        <ol class="capture-workflow">
+          <li>
+            <strong>Make frame 1 the best view.</strong>
+            Keep the board nearly front-facing, sharply focused, and visible
+            beside the object. Aim for at least 30 valid depth corners and
+            reprojection RMSE below 0.5 px.
+          </li>
+          <li>
+            <strong>Move in small steps.</strong>
+            Translate only 2–5 cm or rotate 5–10° between captures.
+          </li>
+          <li>
+            <strong>Preserve surface overlap.</strong>
+            Keep at least 60% of the same object surface visible between
+            neighboring captures. Add intermediate captures before moving to
+            another side.
+          </li>
+          <li>
+            <strong>Keep the scene fixed.</strong>
+            The object and ChArUco board must not move during the session.
+          </li>
+          <li>
+            <strong>Let the camera settle.</strong>
+            Pause after moving so exposure and depth stabilize, then capture
+            without camera motion.
+          </li>
+          <li>
+            <strong>Use depth-friendly lighting.</strong>
+            Prefer diffuse light and avoid glare, deep shadows, reflective
+            surfaces, and board occlusion.
+          </li>
+          <li>
+            <strong>Keep a practical distance.</strong>
+            Stay roughly 35–60 cm from the board and avoid steep viewing
+            angles.
+          </li>
+        </ol>
+        <p class="scan-help-note">
+          Each new frame needs a strong registration connection to at least
+          one earlier frame; it does not need to overlap every frame.
+        </p>
+      </div>
+      <div class="dialog-actions">
+        <span class="dialog-spacer"></span>
+        <button id="dismiss-scan-help-button" class="primary">Got it</button>
+      </div>
+    </dialog>
 
     <dialog id="camera-color-dialog" class="camera-dialog">
       <div class="dialog-header">

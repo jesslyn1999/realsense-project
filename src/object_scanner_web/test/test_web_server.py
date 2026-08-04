@@ -269,6 +269,7 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert b'id="pixel-loupe"' in page.data
         assert b'id="publish-transformation-button"' in page.data
         assert b'id="transformation-mode"' in page.data
+        assert b'<option value="charuco" selected>' in page.data
         assert b'id="json-transformation-panel"' in page.data
         assert b'id="charuco-transformation-panel"' in page.data
         assert b'id="charuco-preview"' in page.data
@@ -289,6 +290,10 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert b'id="camera-overlay-checkbox"' in page.data
         assert b'id="orientation-gizmo"' in page.data
         assert b'id="point-coordinate-tooltip"' in page.data
+        assert b'id="scan-help-button"' in page.data
+        assert b'id="scan-help-dialog"' in page.data
+        assert b"Move in small steps" in page.data
+        assert b"Keep at least 60%" in page.data
         assert client.get("/static/app.js").status_code == 200
         status = client.get("/api/status").json
         assert status["state"] == "stopped"
@@ -427,12 +432,27 @@ def test_points_refuses_missing_or_stale_aligned_output(tmp_path, monkeypatch):
         Path(__file__).parents[1],
         output_directory=tmp_path,
     )
-    response = app.test_client().get("/api/points")
+    client = app.test_client()
+    aligned_response = client.get("/api/points")
+    raw_response = client.get("/api/points?source=raw")
+    invalid_response = client.get("/api/points?source=unknown")
     recording.close()
 
-    assert response.status_code == 422
-    assert not response.json["success"]
-    assert "does not match" in response.json["message"]
+    assert aligned_response.status_code == 422
+    assert not aligned_response.json["success"]
+    assert "does not match" in aligned_response.json["message"]
+
+    assert raw_response.status_code == 200
+    assert raw_response.data[:4] == b"PCD1"
+    assert raw_response.content_type == "application/octet-stream"
+    assert raw_response.headers["Cache-Control"] == "no-store"
+    assert raw_response.headers["X-Displayed-Points"] == "1"
+    assert raw_response.headers["X-Total-Points"] == "1"
+    assert raw_response.headers["X-Preview-Source"] == "raw"
+
+    assert invalid_response.status_code == 400
+    assert not invalid_response.json["success"]
+    assert "source" in invalid_response.json["message"]
 
 
 def test_points_reads_saved_output_after_raw_wal_checkpoint(
@@ -857,6 +877,26 @@ def test_ros_bridge_charuco_capture_composes_color_and_depth_frames(
         "object_scanner_web.web_server.build_charuco_observation",
         lambda *_args: observation,
     )
+    monkeypatch.setattr(
+        web_server,
+        "validate_charuco_depth_consistency",
+        lambda *_args: SimpleNamespace(
+            as_dict=lambda: {
+                "depth_consistency_median_mm": 1.0,
+                "depth_consistency_p95_mm": 2.0,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "validate_sequential_charuco_capture",
+        lambda *_args: SimpleNamespace(
+            as_dict=lambda: {
+                "sequential_correction_mm": 0.0,
+                "sequential_correction_deg": 0.0,
+            }
+        ),
+    )
 
     rclpy.init()
     bridge = RosControlBridge(TRANSFORMATION_PATH)
@@ -966,6 +1006,13 @@ def test_ros_bridge_charuco_capture_composes_color_and_depth_frames(
         assert results[0]["charuco_capture"][
             "valid_depth_corner_count"
         ] == 42
+        assert results[0]["charuco_capture"][
+            "depth_consistency_median_mm"
+        ] == 1.0
+        assert results[0]["charuco_capture"][
+            "sequential_correction_mm"
+        ] == 0.0
+        assert len(bridge._accepted_charuco_evidence) == 1
 
         bridge._on_synchronized_sensor_frame(
             cloud,
@@ -977,6 +1024,91 @@ def test_ros_bridge_charuco_capture_composes_color_and_depth_frames(
     finally:
         if thread is not None:
             thread.join(timeout=1.0)
+        bridge.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("validator_name", "message"),
+    [
+        (
+            "validate_charuco_depth_consistency",
+            "median corner error 6.00 mm; maximum 5.00 mm",
+        ),
+        (
+            "validate_sequential_charuco_capture",
+            "corner solve moved 12.00 mm; maximum 10.00 mm",
+        ),
+    ],
+)
+def test_capture_time_validation_rejects_before_publish(
+    monkeypatch,
+    validator_name,
+    message,
+):
+    class FakePublisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, transform):
+            self.messages.append(transform)
+
+    calibration = CharucoCalibration(
+        camera_to_world=np.eye(4),
+        corner_count=42,
+        reprojection_rmse_px=0.4,
+    )
+    observation = make_charuco_observation()
+
+    def reject(*_args):
+        raise CharucoCalibrationError(
+            message,
+            corner_count=42,
+            reprojection_rmse_px=0.4,
+            valid_depth_corner_count=42,
+        )
+
+    monkeypatch.setattr(web_server, validator_name, reject)
+    if validator_name != "validate_charuco_depth_consistency":
+        monkeypatch.setattr(
+            web_server,
+            "validate_charuco_depth_consistency",
+            lambda *_args: SimpleNamespace(as_dict=lambda: {}),
+        )
+
+    rclpy.init()
+    bridge = RosControlBridge(TRANSFORMATION_PATH)
+    bridge._charuco_capture_id = 1
+    bridge._transform_publisher = FakePublisher()
+    monkeypatch.setattr(
+        bridge,
+        "_calibrate_sensor_frame",
+        lambda *_args: (calibration, np.ones((1, 1))),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_color_from_pointcloud",
+        lambda *_args: np.eye(4),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "build_charuco_observation",
+        lambda *_args: observation,
+    )
+    try:
+        bridge._on_synchronized_sensor_frame(
+            PointCloud2(),
+            Image(),
+            Image(),
+            CameraInfo(),
+        )
+
+        assert bridge._transform_publisher.messages == []
+        assert bridge._accepted_charuco_evidence == []
+        assert isinstance(bridge._charuco_error, CharucoCalibrationError)
+        assert str(bridge._charuco_error) == message
+        assert bridge._last_charuco["message"] == message
+    finally:
         bridge.destroy_node()
         rclpy.shutdown()
 
@@ -1035,6 +1167,8 @@ def test_ros_bridge_publishes_and_iterates_timestamp_matched_transforms(
     bridge = RosControlBridge(transformation_path)
     publisher = FakePublisher()
     bridge._transform_publisher = publisher
+    assert bridge.status()["transformation_mode"] == "charuco"
+    bridge._transformation_mode = "json"
     assert bridge.step_transformation(-1)["transformation"] == (
         offset_transformation
     )

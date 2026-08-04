@@ -573,6 +573,28 @@ h2 {
     );
 }
 
+.viewer-help-button {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 4;
+  width: 40px;
+  min-height: 40px;
+  border-color: var(--border-strong);
+  border-radius: 50%;
+  padding: 0;
+  background: var(--surface-translucent);
+  color: var(--text);
+  font-size: 1.15rem;
+  font-weight: 800;
+  backdrop-filter: blur(10px);
+}
+
+.viewer-help-button:hover {
+  border-color: var(--accent-border);
+  color: var(--accent-label);
+}
+
 .orientation-gizmo {
   position: absolute;
   top: 16px;
@@ -756,6 +778,46 @@ h2 {
 .camera-dialog::backdrop {
   background: var(--dialog-backdrop);
   backdrop-filter: blur(5px);
+}
+
+.scan-help-dialog {
+  width: min(720px, calc(100vw - 40px));
+}
+
+.scan-help-content {
+  padding: 20px;
+}
+
+.capture-workflow {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding-left: 24px;
+}
+
+.capture-workflow li {
+  padding-left: 5px;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.capture-workflow li::marker {
+  color: var(--accent-label);
+  font-weight: 800;
+}
+
+.capture-workflow strong {
+  color: var(--text);
+}
+
+.scan-help-note {
+  margin: 20px 0 0;
+  border: 1px solid var(--instruction-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--instruction-bg);
+  color: var(--text);
+  line-height: 1.5;
 }
 
 .dialog-header,

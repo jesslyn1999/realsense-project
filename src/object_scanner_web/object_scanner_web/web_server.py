@@ -30,6 +30,11 @@ from object_scanner_processing.charuco_observations import (
     calibrate_charuco,
     CharucoCalibrationError,
     depth_image_to_meters,
+    validate_charuco_depth_consistency,
+)
+from object_scanner_processing.pointcloud_processing import (
+    CharucoPoseEvidence,
+    validate_sequential_charuco_capture,
 )
 from object_scanner_web.camera_frame import (
     build_camera_payload,
@@ -38,6 +43,7 @@ from object_scanner_web.camera_frame import (
 )
 from object_scanner_web.sqlite_reader import (
     build_array_payload,
+    build_point_payload,
     build_replay_frame_payload,
     list_frames,
     PAYLOAD_HEADER,
@@ -139,7 +145,7 @@ class RosControlBridge(Node):
     def __init__(self, transformation_path: Path | None = None) -> None:
         super().__init__("object_scanner_web")
         self.declare_parameter("output_directory", "scans")
-        self.declare_parameter("target_rgb", [0, 255, 0])
+        self.declare_parameter("target_rgb", [179, 192, 187])
         self.output_directory = Path(
             self.get_parameter("output_directory").value
         ).expanduser()
@@ -152,7 +158,7 @@ class RosControlBridge(Node):
         self._transformations = load_transformation_matrices(
             transformation_path
         )
-        self._transformation_mode = "json"
+        self._transformation_mode = "charuco"
         self._transformation_index = 0
         self._active_transformation = None
         self._remaining_transform_messages = 0
@@ -161,6 +167,7 @@ class RosControlBridge(Node):
         self._charuco_result: dict | None = None
         self._charuco_error: Exception | None = None
         self._last_charuco: dict | None = None
+        self._accepted_charuco_evidence: list[CharucoPoseEvidence] = []
         self._state = "stopped"
         self._database_path: str | None = None
         self._session_name: str | None = None
@@ -295,6 +302,8 @@ class RosControlBridge(Node):
                 if command == "start":
                     self._state = "recording"
                     self._database_path = response.message
+                    with self._transform_condition:
+                        self._accepted_charuco_evidence.clear()
                 elif command == "pause":
                     self._state = "paused"
                 elif command == "resume":
@@ -605,6 +614,7 @@ class RosControlBridge(Node):
     ) -> None:
         with self._transform_condition:
             capture_id = self._charuco_capture_id
+            prior_evidence = tuple(self._accepted_charuco_evidence)
         if capture_id is None:
             return
 
@@ -629,6 +639,18 @@ class RosControlBridge(Node):
                 np.asarray(camera_info.d, dtype=np.float64),
                 color_from_pointcloud,
             )
+            depth_consistency = validate_charuco_depth_consistency(
+                observation,
+                world_from_pointcloud,
+            )
+            pose_evidence = CharucoPoseEvidence(
+                matrix=world_from_pointcloud,
+                observation=observation,
+            )
+            sequential_metrics = validate_sequential_charuco_capture(
+                prior_evidence,
+                pose_evidence,
+            )
             transformation = TransformationMatrix(
                 name="charuco",
                 parent_frame_id="world",
@@ -649,6 +671,8 @@ class RosControlBridge(Node):
                 message="ChArUco pose accepted",
                 matrix=world_from_pointcloud.tolist(),
             )
+            capture.update(depth_consistency.as_dict())
+            capture.update(sequential_metrics.as_dict())
         except (CharucoCalibrationError, ValueError) as error:
             if isinstance(error, CharucoCalibrationError):
                 capture_error = error
@@ -667,6 +691,7 @@ class RosControlBridge(Node):
             if self._charuco_capture_id != capture_id:
                 return
             self._transform_publisher.publish(transform_message)
+            self._accepted_charuco_evidence.append(pose_evidence)
             self._charuco_result = capture
             self._last_charuco = capture
             self._charuco_capture_id = None
@@ -1113,6 +1138,16 @@ def create_app(
 
     @app.get("/api/points")
     def points():
+        source = request.args.get("source", "aligned")
+        if source not in {"aligned", "raw"}:
+            return (
+                jsonify(
+                    success=False,
+                    message="source must be 'aligned' or 'raw'",
+                ),
+                400,
+            )
+
         current = bridge.status()
         if current["state"] not in {"paused", "stopped"}:
             return (
@@ -1134,6 +1169,31 @@ def create_app(
                 jsonify(success=False, message="Recording database not found"),
                 404,
             )
+
+        if source == "raw":
+            try:
+                payload = build_point_payload(
+                    database_path,
+                    MAX_DISPLAY_POINTS,
+                )
+            except (sqlite3.Error, ValueError) as error:
+                return (
+                    jsonify(
+                        success=False,
+                        message=f"Cannot load raw points: {error}",
+                    ),
+                    500,
+                )
+
+            displayed_points, total_points = PAYLOAD_HEADER.unpack_from(
+                payload
+            )[1:]
+            response = Response(payload, mimetype="application/octet-stream")
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Displayed-Points"] = str(displayed_points)
+            response.headers["X-Total-Points"] = str(total_points)
+            response.headers["X-Preview-Source"] = "raw"
+            return response
 
         try:
             revision = source_revision(database_path)

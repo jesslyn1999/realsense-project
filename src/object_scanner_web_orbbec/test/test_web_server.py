@@ -283,6 +283,10 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert b'id="camera-overlay-checkbox"' in page.data
         assert b'id="orientation-gizmo"' in page.data
         assert b'id="point-coordinate-tooltip"' in page.data
+        assert b'id="scan-help-button"' in page.data
+        assert b'id="scan-help-dialog"' in page.data
+        assert b"Move in small steps" in page.data
+        assert b"Keep at least 60%" in page.data
         assert client.get("/static/app.js").status_code == 200
         status = client.get("/api/status").json
         assert status["state"] == "stopped"

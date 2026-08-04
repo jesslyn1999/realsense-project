@@ -7,6 +7,14 @@ const orientationGizmo = document.querySelector("#orientation-gizmo");
 const pointCoordinateTooltip = document.querySelector(
   "#point-coordinate-tooltip",
 );
+const scanHelpButton = document.querySelector("#scan-help-button");
+const scanHelpDialog = document.querySelector("#scan-help-dialog");
+const closeScanHelpButton = document.querySelector(
+  "#close-scan-help-button",
+);
+const dismissScanHelpButton = document.querySelector(
+  "#dismiss-scan-help-button",
+);
 const themeToggle = document.querySelector("#theme-toggle");
 const stateBadge = document.querySelector("#state-badge");
 const sessionNameInput = document.querySelector("#session-name");
@@ -188,7 +196,7 @@ scene.add(axesHelper);
 let currentState = "stopped";
 let currentDatabasePath = null;
 let transformBurstActive = false;
-let transformationMode = "json";
+let transformationMode = "charuco";
 let pointCloud = null;
 let cameraRgb = null;
 let cameraWidth = 0;
@@ -658,12 +666,37 @@ function renderPayload(buffer) {
   updateControls();
 }
 
+async function loadRawPoints(alignmentError) {
+  try {
+    const response = await fetch("/api/points?source=raw", {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.message || "Cannot load raw points");
+    }
+    renderPayload(await response.arrayBuffer());
+    setMessage(
+      `${alignmentError} Showing a combined raw preview using captured poses; ` +
+        "it is not refinement-aligned.",
+      true,
+    );
+  } catch (error) {
+    clearPointCloud();
+    setMessage(
+      `${alignmentError} Raw preview also failed: ${error.message}`,
+      true,
+    );
+  }
+}
+
 async function loadPoints() {
   setMessage("Loading saved aligned point clouds…");
   const response = await fetch("/api/points", { cache: "no-store" });
   if (!response.ok) {
     const error = await response.json();
-    throw new Error(error.message || "Cannot load aligned points");
+    await loadRawPoints(error.message || "Cannot load aligned points");
+    return;
   }
   renderPayload(await response.arrayBuffer());
   const acceptedEdges = response.headers.get("X-Accepted-Edges");
@@ -1346,6 +1379,18 @@ async function sendCommand(command) {
       applyStatus(result);
     }
     if (!response.ok) {
+      const alignmentFailedAfterTransition =
+        (command === "pause" && result.state === "paused") ||
+        (command === "stop" && result.state === "stopped");
+      if (alignmentFailedAfterTransition) {
+        if (command === "stop") {
+          await loadSavedSessions();
+        }
+        await loadRawPoints(
+          result.message || `Cannot ${command} and align recording`,
+        );
+        return;
+      }
       if (["pause", "stop"].includes(command)) {
         clearPointCloud();
       }
@@ -1398,6 +1443,9 @@ async function loadStatus() {
 for (const [command, button] of Object.entries(commandButtons)) {
   button.addEventListener("click", () => sendCommand(command));
 }
+scanHelpButton.addEventListener("click", () => scanHelpDialog.showModal());
+closeScanHelpButton.addEventListener("click", () => scanHelpDialog.close());
+dismissScanHelpButton.addEventListener("click", () => scanHelpDialog.close());
 themeToggle.addEventListener("click", () => {
   const nextTheme =
     document.documentElement.dataset.theme === "light" ? "dark" : "light";

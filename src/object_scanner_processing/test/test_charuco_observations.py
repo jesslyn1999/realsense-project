@@ -3,15 +3,20 @@ import numpy as np
 
 from object_scanner_processing.charuco_observations import (
     annotate_charuco,
+    board_points_world,
     build_charuco_observation,
     calibrate_charuco,
     calibrate_charuco_points,
     CharucoCalibration,
     CharucoCalibrationError,
+    CharucoFrameObservation,
     depth_image_to_meters,
     detect_charuco,
+    DEPTH_CONSISTENCY_MEDIAN_LIMIT_M,
+    DEPTH_CONSISTENCY_P95_LIMIT_M,
     MAX_REPROJECTION_RMSE_PX,
     MIN_CORNER_COUNT,
+    validate_charuco_depth_consistency,
 )
 import pytest
 
@@ -259,3 +264,61 @@ def test_reports_too_few_valid_depth_corners():
     assert caught.value.invalid_depth_reasons == {
         "insufficient_valid_depth": 1
     }
+
+
+def _consistent_observation(errors_m):
+    errors = np.asarray(errors_m, dtype=np.float64)
+    corner_ids = np.arange(len(errors), dtype=np.int32)
+    child_points = board_points_world(corner_ids)
+    child_points[:, 2] += errors
+    return CharucoFrameObservation(
+        corner_ids=corner_ids,
+        image_points=np.zeros((len(errors), 2)),
+        depth_valid=np.ones(len(errors), dtype=bool),
+        child_points=child_points,
+        depth_valid_pixel_counts=np.full(len(errors), 25, dtype=np.uint16),
+        depth_inlier_pixel_counts=np.full(len(errors), 25, dtype=np.uint16),
+        depth_mad_m=np.zeros(len(errors)),
+        depth_invalid_reasons=("",) * len(errors),
+        camera_matrix=np.eye(3),
+        distortion=np.zeros(5),
+        color_from_child=np.eye(4),
+        initial_reprojection_errors_px=np.full(len(errors), 0.2),
+        initial_reprojection_rmse_px=0.2,
+    )
+
+
+def test_depth_consistency_accepts_errors_within_limits():
+    metrics = validate_charuco_depth_consistency(
+        _consistent_observation(np.full(20, 0.002)),
+        np.eye(4),
+    )
+
+    assert metrics.median_error_m == pytest.approx(0.002)
+    assert metrics.p95_error_m == pytest.approx(0.002)
+
+
+def test_depth_consistency_rejects_median_over_limit():
+    observation = _consistent_observation(
+        np.full(20, DEPTH_CONSISTENCY_MEDIAN_LIMIT_M + 0.001)
+    )
+
+    with pytest.raises(
+        CharucoCalibrationError,
+        match=r"median corner error 6.00 mm \(maximum 5.00 mm\)",
+    ):
+        validate_charuco_depth_consistency(observation, np.eye(4))
+
+
+def test_depth_consistency_rejects_p95_over_limit():
+    errors = np.full(20, 0.002)
+    errors[-2:] = DEPTH_CONSISTENCY_P95_LIMIT_M + 0.002
+
+    with pytest.raises(
+        CharucoCalibrationError,
+        match=r"95th percentile 12.00 mm \(maximum 10.00 mm\)",
+    ):
+        validate_charuco_depth_consistency(
+            _consistent_observation(errors),
+            np.eye(4),
+        )

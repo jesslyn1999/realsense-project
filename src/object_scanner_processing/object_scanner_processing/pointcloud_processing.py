@@ -13,6 +13,8 @@ import numpy as np
 from object_scanner_processing.charuco_observations import (
     board_points_opencv,
     board_points_world,
+    CharucoCalibrationError,
+    CharucoFrameObservation,
     MIN_CORNER_COUNT,
     WORLD_FROM_OPENCV_BOARD,
 )
@@ -63,6 +65,31 @@ CHARUCO_CLOUD_ACCEPTANCE_FRACTION = 0.99
 
 class PointCloudProcessingError(RuntimeError):
     """Raised when a session cannot be refined without unsafe assumptions."""
+
+
+@dataclass(frozen=True)
+class CharucoPoseEvidence:
+    """One accepted capture used by the sequential corner-pose check."""
+
+    matrix: np.ndarray
+    observation: CharucoFrameObservation
+
+
+@dataclass(frozen=True)
+class SequentialCharucoMetrics:
+    """Capture-time correction required by prior ChArUco evidence."""
+
+    correction_m: float
+    correction_deg: float
+
+    def as_dict(self) -> dict:
+        """Return browser-facing correction metrics and safety limits."""
+        return {
+            "sequential_correction_mm": self.correction_m * 1000.0,
+            "sequential_correction_deg": self.correction_deg,
+            "sequential_translation_limit_mm": MAX_CORRECTION_M * 1000.0,
+            "sequential_rotation_limit_deg": MAX_CORRECTION_DEG,
+        }
 
 
 def _require_open3d() -> None:
@@ -492,7 +519,9 @@ def _solve_hybrid_charuco_pose(
         raise PointCloudProcessingError(
             f"Frame {frame.id} corner solve moved "
             f"{correction_m * 1000.0:.2f} mm and "
-            f"{correction_deg:.3f} deg from its captured pose"
+            f"{correction_deg:.3f} deg from its captured pose; maximums are "
+            f"{MAX_CORRECTION_M * 1000.0:.2f} mm and "
+            f"{MAX_CORRECTION_DEG:.3f} deg"
         )
     return pose
 
@@ -531,6 +560,60 @@ def _sequential_charuco_poses(
             )
         )
     return tuple(poses)
+
+
+def validate_sequential_charuco_capture(
+    prior_evidence: tuple[CharucoPoseEvidence, ...],
+    candidate: CharucoPoseEvidence,
+) -> SequentialCharucoMetrics:
+    """Reject a capture whose corner solve exceeds offline safety limits."""
+    if not prior_evidence:
+        return SequentialCharucoMetrics(
+            correction_m=0.0,
+            correction_deg=0.0,
+        )
+
+    evidence = (*prior_evidence, candidate)
+    empty_xyz = np.empty((0, 3), dtype="<f4")
+    empty_rgb = np.empty((0, 3), dtype=np.uint8)
+    frames = [
+        RecordedFrame(
+            id=index + 1,
+            recorded_perf_counter_ns=0,
+            source_sec=0,
+            source_nanosec=0,
+            parent_frame_id="world",
+            transformation_name="charuco",
+            matrix=item.matrix,
+            xyz=empty_xyz,
+            rgb=empty_rgb,
+            charuco=item.observation,
+        )
+        for index, item in enumerate(evidence)
+    ]
+    try:
+        poses = _sequential_charuco_poses(frames)
+    except PointCloudProcessingError as error:
+        observation = candidate.observation
+        raise CharucoCalibrationError(
+            str(error),
+            corner_count=len(observation.corner_ids),
+            reprojection_rmse_px=(
+                observation.initial_reprojection_rmse_px
+            ),
+            valid_depth_corner_count=(
+                observation.valid_depth_corner_count
+            ),
+            invalid_depth_corner_count=(
+                observation.invalid_depth_corner_count
+            ),
+        ) from error
+
+    correction = _pose_delta(poses[-1], candidate.matrix)
+    return SequentialCharucoMetrics(
+        correction_m=float(np.linalg.norm(correction[:3, 3])),
+        correction_deg=_rotation_degrees(correction),
+    )
 
 
 def _make_cloud(xyz: np.ndarray, rgb: np.ndarray) -> o3d.geometry.PointCloud:
@@ -932,7 +1015,10 @@ def _register_edge(
     )
 
 
-def _is_connected(frame_count: int, edges: list[_AcceptedEdge]) -> bool:
+def _connected_frame_indices(
+    frame_count: int,
+    edges: list[_AcceptedEdge],
+) -> set[int]:
     adjacency = [set() for _ in range(frame_count)]
     for edge in edges:
         adjacency[edge.source_index].add(edge.target_index)
@@ -944,7 +1030,7 @@ def _is_connected(frame_count: int, edges: list[_AcceptedEdge]) -> bool:
         for neighbor in adjacency[current] - visited:
             visited.add(neighbor)
             pending.append(neighbor)
-    return len(visited) == frame_count
+    return visited
 
 
 def _spanning_tree_edge_indices(
@@ -984,10 +1070,48 @@ def _spanning_tree_edge_indices(
 def _optimize_poses(
     prepared: list[_PreparedFrame],
     edges: list[_AcceptedEdge],
+    edge_diagnostics: list[EdgeDiagnostics],
 ) -> tuple[np.ndarray, ...]:
-    if not _is_connected(len(prepared), edges):
+    frame_count = len(prepared)
+    connected = _connected_frame_indices(frame_count, edges)
+    if len(connected) != frame_count:
+        candidate_edge_count = frame_count * (frame_count - 1) // 2
+        minimum_edge_count = frame_count - 1
+        minimum_edge_label = (
+            "edge" if minimum_edge_count == 1 else "edges"
+        )
+        minimum_edge_verb = "is" if minimum_edge_count == 1 else "are"
+        disconnected_ids = [
+            frame.recorded.id
+            for index, frame in enumerate(prepared)
+            if index not in connected
+        ]
+        rejected = [
+            diagnostics
+            for diagnostics in edge_diagnostics
+            if not diagnostics.accepted
+        ]
+        rejection_details = "; ".join(
+            f"{diagnostics.source_frame_id}->{diagnostics.target_frame_id}: "
+            f"{diagnostics.reason}"
+            for diagnostics in rejected[:3]
+        )
+        if len(rejected) > 3:
+            rejection_details += f"; plus {len(rejected) - 3} more"
         raise PointCloudProcessingError(
-            "Accepted registration edges do not connect every captured frame"
+            "Accepted registration edges do not connect every captured frame: "
+            f"{len(connected)}/{frame_count} frames connect to frame 1; "
+            f"{frame_count}/{frame_count} are required. Accepted "
+            f"{len(edges)}/{candidate_edge_count} candidate edges; at least "
+            f"{minimum_edge_count} accepted {minimum_edge_label} "
+            f"{minimum_edge_verb} necessary. "
+            f"Disconnected frame IDs: {disconnected_ids}. Edge overlap "
+            f"thresholds are {MIN_OVERLAP:.0%} within "
+            f"{OVERLAP_DISTANCE_M * 1000.0:.0f} mm and "
+            f"{MIN_STRICT_OVERLAP:.0%} within "
+            f"{STRICT_OVERLAP_DISTANCE_M * 1000.0:.0f} mm"
+            f". Rejected {len(rejected)}/{candidate_edge_count} candidate "
+            f"edges: {rejection_details}"
         )
 
     pose_graph = o3d.pipelines.registration.PoseGraph()
@@ -1480,7 +1604,11 @@ def _process_frames(frames: list[RecordedFrame]) -> ProcessingResult:
                     diagnostics.correction_deg,
                 )
 
-    poses = _optimize_poses(prepared, accepted_edges)
+    poses = _optimize_poses(
+        prepared,
+        accepted_edges,
+        edge_diagnostics,
+    )
     _validate_optimized_edges(prepared, poses, accepted_edges)
     (
         charuco_frame_diagnostics,

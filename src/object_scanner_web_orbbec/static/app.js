@@ -7,6 +7,14 @@ const orientationGizmo = document.querySelector("#orientation-gizmo");
 const pointCoordinateTooltip = document.querySelector(
   "#point-coordinate-tooltip",
 );
+const scanHelpButton = document.querySelector("#scan-help-button");
+const scanHelpDialog = document.querySelector("#scan-help-dialog");
+const closeScanHelpButton = document.querySelector(
+  "#close-scan-help-button",
+);
+const dismissScanHelpButton = document.querySelector(
+  "#dismiss-scan-help-button",
+);
 const themeToggle = document.querySelector("#theme-toggle");
 const stateBadge = document.querySelector("#state-badge");
 const sessionNameInput = document.querySelector("#session-name");
@@ -1281,6 +1289,9 @@ async function sendCommand(command) {
       applyStatus(result);
     }
     if (!response.ok) {
+      if (command === "stop" && result.state === "stopped") {
+        await loadSavedSessions();
+      }
       if (["pause", "stop"].includes(command)) {
         clearPointCloud();
       }
@@ -1333,6 +1344,9 @@ async function loadStatus() {
 for (const [command, button] of Object.entries(commandButtons)) {
   button.addEventListener("click", () => sendCommand(command));
 }
+scanHelpButton.addEventListener("click", () => scanHelpDialog.showModal());
+closeScanHelpButton.addEventListener("click", () => scanHelpDialog.close());
+dismissScanHelpButton.addEventListener("click", () => scanHelpDialog.close());
 themeToggle.addEventListener("click", () => {
   const nextTheme =
     document.documentElement.dataset.theme === "light" ? "dark" : "light";

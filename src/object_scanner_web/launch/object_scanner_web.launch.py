@@ -48,7 +48,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "target_rgb",
-                default_value="[0, 255, 0]",
+                default_value="[179, 192, 187]",
             ),
             DeclareLaunchArgument(
                 "lab_threshold",

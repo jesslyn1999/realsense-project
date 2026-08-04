@@ -4,6 +4,7 @@ import numpy as np
 from object_scanner_processing.charuco_observations import (
     board_points_opencv,
     board_points_world,
+    CharucoCalibrationError,
     CharucoFrameObservation,
     WORLD_FROM_OPENCV_BOARD,
 )
@@ -11,9 +12,11 @@ import object_scanner_processing.pointcloud_processing as processing
 from object_scanner_processing.pointcloud_processing import (
     _fuse_voxels,
     _sequential_charuco_poses,
+    CharucoPoseEvidence,
     charuco_frame_weight,
     PointCloudProcessingError,
     process_frames,
+    validate_sequential_charuco_capture,
 )
 from object_scanner_processing.recording import RecordedFrame
 import pytest
@@ -185,6 +188,65 @@ def test_sequential_corner_solve_anchors_first_frame_and_improves_later_poses():
         assert after[1] < before[1]
         assert after[0] < 1e-6
         assert after[1] < 1e-4
+
+
+def test_capture_sequential_check_accepts_small_pose_correction():
+    first_pose = _charuco_camera_pose(
+        [0.0, 0.0, 0.0],
+        [-0.09, -0.06, 0.40],
+    )
+    second_pose = _charuco_camera_pose(
+        [0.02, -0.03, 0.01],
+        [-0.08, -0.055, 0.41],
+    )
+    recorded_second = (
+        _pose([0.002, -0.001, 0.001], [0, 1, 0], 0.3) @ second_pose
+    )
+
+    metrics = validate_sequential_charuco_capture(
+        (
+            CharucoPoseEvidence(
+                first_pose,
+                _charuco_observation(first_pose),
+            ),
+        ),
+        CharucoPoseEvidence(
+            recorded_second,
+            _charuco_observation(second_pose),
+        ),
+    )
+
+    assert metrics.correction_m < processing.MAX_CORRECTION_M
+    assert metrics.correction_deg < processing.MAX_CORRECTION_DEG
+
+
+def test_capture_sequential_check_rejects_large_pose_correction():
+    first_pose = _charuco_camera_pose(
+        [0.0, 0.0, 0.0],
+        [-0.09, -0.06, 0.40],
+    )
+    second_pose = _charuco_camera_pose(
+        [0.02, -0.03, 0.01],
+        [-0.08, -0.055, 0.41],
+    )
+    recorded_second = _pose([0.020, 0.0, 0.0]) @ second_pose
+
+    with pytest.raises(
+        CharucoCalibrationError,
+        match=r"maximums are 10.00 mm and 2.000 deg",
+    ):
+        validate_sequential_charuco_capture(
+            (
+                CharucoPoseEvidence(
+                    first_pose,
+                    _charuco_observation(first_pose),
+                ),
+            ),
+            CharucoPoseEvidence(
+                recorded_second,
+                _charuco_observation(second_pose),
+            ),
+        )
 
 
 def test_charuco_processing_refuses_missing_observations():
@@ -495,5 +557,18 @@ def test_rejects_disconnected_low_overlap_frames():
         ),
     ]
 
-    with pytest.raises(PointCloudProcessingError, match="do not connect"):
+    with pytest.raises(
+        PointCloudProcessingError,
+        match="do not connect",
+    ) as caught:
         process_frames(frames)
+
+    message = str(caught.value)
+    assert "1/2 frames connect" in message
+    assert "2/2 are required" in message
+    assert "Accepted 0/1 candidate edges" in message
+    assert "at least 1 accepted edge is necessary" in message
+    assert "60% within 12 mm" in message
+    assert "15% within 5 mm" in message
+    assert "Rejected 1/1 candidate edges" in message
+    assert "1->2: initial 12 mm overlap" in message
