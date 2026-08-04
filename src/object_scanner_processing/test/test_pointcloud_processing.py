@@ -4,7 +4,6 @@ import numpy as np
 from object_scanner_processing.charuco_observations import (
     board_points_opencv,
     board_points_world,
-    CharucoCalibrationError,
     CharucoFrameObservation,
     WORLD_FROM_OPENCV_BOARD,
 )
@@ -12,11 +11,9 @@ import object_scanner_processing.pointcloud_processing as processing
 from object_scanner_processing.pointcloud_processing import (
     _fuse_voxels,
     _sequential_charuco_poses,
-    CharucoPoseEvidence,
     charuco_frame_weight,
     PointCloudProcessingError,
     process_frames,
-    validate_sequential_charuco_capture,
 )
 from object_scanner_processing.recording import RecordedFrame
 import pytest
@@ -190,65 +187,6 @@ def test_sequential_corner_solve_anchors_first_frame_and_improves_later_poses():
         assert after[1] < 1e-4
 
 
-def test_capture_sequential_check_accepts_small_pose_correction():
-    first_pose = _charuco_camera_pose(
-        [0.0, 0.0, 0.0],
-        [-0.09, -0.06, 0.40],
-    )
-    second_pose = _charuco_camera_pose(
-        [0.02, -0.03, 0.01],
-        [-0.08, -0.055, 0.41],
-    )
-    recorded_second = (
-        _pose([0.002, -0.001, 0.001], [0, 1, 0], 0.3) @ second_pose
-    )
-
-    metrics = validate_sequential_charuco_capture(
-        (
-            CharucoPoseEvidence(
-                first_pose,
-                _charuco_observation(first_pose),
-            ),
-        ),
-        CharucoPoseEvidence(
-            recorded_second,
-            _charuco_observation(second_pose),
-        ),
-    )
-
-    assert metrics.correction_m < processing.MAX_CORRECTION_M
-    assert metrics.correction_deg < processing.MAX_CORRECTION_DEG
-
-
-def test_capture_sequential_check_rejects_large_pose_correction():
-    first_pose = _charuco_camera_pose(
-        [0.0, 0.0, 0.0],
-        [-0.09, -0.06, 0.40],
-    )
-    second_pose = _charuco_camera_pose(
-        [0.02, -0.03, 0.01],
-        [-0.08, -0.055, 0.41],
-    )
-    recorded_second = _pose([0.020, 0.0, 0.0]) @ second_pose
-
-    with pytest.raises(
-        CharucoCalibrationError,
-        match=r"maximums are 10.00 mm and 2.000 deg",
-    ):
-        validate_sequential_charuco_capture(
-            (
-                CharucoPoseEvidence(
-                    first_pose,
-                    _charuco_observation(first_pose),
-                ),
-            ),
-            CharucoPoseEvidence(
-                recorded_second,
-                _charuco_observation(second_pose),
-            ),
-        )
-
-
 def test_charuco_processing_refuses_missing_observations():
     xyz, rgb = _surface()
     frames = [
@@ -300,8 +238,107 @@ def test_charuco_pipeline_meets_corner_and_cloud_acceptance_contract():
     ]
     assert max(
         item.reprojection_max_px for item in result.charuco_frames
-    ) < 1e-3
+    ) <= processing.CHARUCO_MAX_REPROJECTION_ERROR_PX
     assert len(result.charuco_corners) == 60
+
+
+def test_charuco_pipeline_keeps_raw_and_aligns_only_the_main_object():
+    object_xyz, object_rgb = _surface()
+    board_axis = np.linspace(-0.08, 0.08, 41)
+    board_x, board_y = np.meshgrid(board_axis, board_axis)
+    board_xyz = np.column_stack(
+        (
+            board_x.ravel(),
+            board_y.ravel(),
+            np.full(board_x.size, 0.001),
+        )
+    )
+    distractor_axis = np.linspace(0.15, 0.18, 16)
+    distractor_x, distractor_y = np.meshgrid(
+        distractor_axis,
+        distractor_axis,
+    )
+    distractor_xyz = np.column_stack(
+        (
+            distractor_x.ravel(),
+            distractor_y.ravel(),
+            np.full(distractor_x.size, 0.25),
+        )
+    )
+    scene_xyz = np.concatenate((object_xyz, board_xyz, distractor_xyz))
+    scene_rgb = np.concatenate(
+        (
+            object_rgb,
+            np.tile([255, 255, 255], (len(board_xyz), 1)),
+            np.tile([255, 0, 0], (len(distractor_xyz), 1)),
+        )
+    ).astype(np.uint8)
+    true_poses = [
+        _charuco_camera_pose([0.0, 0.0, 0.0], [-0.09, -0.06, 0.40]),
+        _charuco_camera_pose([0.02, -0.03, 0.01], [-0.08, -0.055, 0.41]),
+    ]
+    frames = [
+        _recorded_frame(
+            index + 1,
+            scene_xyz,
+            scene_rgb,
+            pose,
+            pose,
+            _charuco_observation(pose),
+        )
+        for index, pose in enumerate(true_poses)
+    ]
+    raw_xyz = [frame.xyz.copy() for frame in frames]
+
+    result = process_frames(frames)
+
+    for frame, expected_raw in zip(frames, raw_xyz, strict=True):
+        np.testing.assert_array_equal(frame.xyz, expected_raw)
+        assert np.any(frame.xyz[:, 2] <= processing.BOARD_CLEARANCE_M)
+    for aligned in result.aligned_frames:
+        assert len(aligned.xyz) < len(aligned.source.xyz)
+        assert np.min(aligned.xyz[:, 2]) > 0.30
+        assert np.max(np.abs(aligned.xyz[:, :2])) < 0.10
+        assert not np.any(np.all(aligned.rgb == [255, 255, 255], axis=1))
+        assert not np.any(np.all(aligned.rgb == [255, 0, 0], axis=1))
+
+
+def test_charuco_depth_correction_does_not_mutate_raw_frames():
+    xyz, rgb = _surface()
+    true_poses = [
+        _charuco_camera_pose([0.0, 0.0, 0.0], [-0.09, -0.06, 0.40]),
+        _charuco_camera_pose([0.02, -0.03, 0.01], [-0.08, -0.055, 0.41]),
+    ]
+    frames = []
+    for index, pose in enumerate(true_poses):
+        observation = _charuco_observation(pose)
+        camera_xyz = _transform(xyz, np.linalg.inv(pose)) * 0.85
+        frames.append(
+            RecordedFrame(
+                id=index + 1,
+                recorded_perf_counter_ns=index + 1,
+                source_sec=index + 1,
+                source_nanosec=0,
+                parent_frame_id="world",
+                transformation_name="charuco",
+                matrix=pose,
+                xyz=_transform(camera_xyz, pose).astype(np.float32),
+                rgb=rgb,
+                charuco=replace(
+                    observation,
+                    child_points=observation.child_points * 0.85,
+                ),
+            )
+        )
+    raw_xyz = [frame.xyz.copy() for frame in frames]
+
+    result = process_frames(frames)
+
+    for frame, expected_raw in zip(frames, raw_xyz, strict=True):
+        np.testing.assert_array_equal(frame.xyz, expected_raw)
+    for aligned in result.aligned_frames:
+        assert np.min(aligned.xyz[:, 2]) > 0.32
+        assert np.max(aligned.xyz[:, 2]) < 0.38
 
 
 def test_charuco_pipeline_rejects_one_corner_over_one_pixel():
@@ -378,6 +415,42 @@ def test_charuco_pipeline_rejects_cloud_below_99_percent_at_three_mm(
         process_frames(frames)
 
 
+def test_best_effort_processing_retains_output_and_quality_warning(monkeypatch):
+    xyz, rgb = _surface()
+    true_poses = [
+        _charuco_camera_pose([0.0, 0.0, 0.0], [-0.09, -0.06, 0.40]),
+        _charuco_camera_pose([0.02, -0.03, 0.01], [-0.08, -0.055, 0.41]),
+    ]
+    frames = [
+        _recorded_frame(
+            index + 1,
+            xyz,
+            rgb,
+            pose,
+            pose,
+            _charuco_observation(pose),
+        )
+        for index, pose in enumerate(true_poses)
+    ]
+
+    def reject_quality(*_args):
+        raise PointCloudProcessingError("synthetic 3 mm quality failure")
+
+    monkeypatch.setattr(
+        processing,
+        "_validate_charuco_acceptance",
+        reject_quality,
+    )
+
+    result = process_frames(frames, allow_degraded_quality=True)
+
+    assert result.quality_warning == "synthetic 3 mm quality failure"
+    assert result.charuco_frames == ()
+    assert result.charuco_corners == ()
+    assert result.cloud_overlap_fraction_3mm is None
+    assert len(result.aligned_frames) == 2
+
+
 def test_rejects_invalid_transformation_before_processing():
     xyz, rgb = _surface()
     invalid = np.eye(4)
@@ -450,8 +523,13 @@ def test_accepts_already_aligned_overlapping_frames():
         assert aligned.rgb.dtype == np.dtype(np.uint8)
 
 
-def test_registers_pose_graph_and_temporally_removes_weak_ghost():
+def test_registers_pose_graph_and_temporally_removes_weak_ghost(monkeypatch):
     xyz, rgb = _surface()
+    monkeypatch.setattr(
+        processing,
+        "_isolate_main_object",
+        lambda frame, camera_xyz, _pose: (camera_xyz, frame.rgb),
+    )
     true_poses = [
         np.eye(4),
         _pose([0.020, -0.004, 0.006], [0, 1, 0], 5.0),

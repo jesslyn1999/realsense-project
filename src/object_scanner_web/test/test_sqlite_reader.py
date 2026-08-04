@@ -122,7 +122,7 @@ def test_builds_raw_filtered_and_aligned_replay_stages(tmp_path):
             transformation_name="identity",
             transformation_matrix=initial_pose,
             xyz=np.array(
-                [[1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [101.0, 0.0, 1.0]],
+                [[1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [101.0, 0.0, 0.0]],
                 dtype="<f4",
             ),
             rgb=rgb,
@@ -165,6 +165,9 @@ def test_builds_raw_filtered_and_aligned_replay_stages(tmp_path):
         np.testing.assert_array_equal(raw_xyz[:, 0], [1.0, 2.0, 101.0])
         np.testing.assert_array_equal(filtered_xyz[:, 0], [1.0, 2.0])
         np.testing.assert_array_equal(aligned_xyz[:, 0], [3.0, 4.0])
+        np.testing.assert_array_equal(raw_xyz[:, 2], [1.0, 1.0, 0.0])
+        np.testing.assert_array_equal(filtered_xyz[:, 2], [1.0, 1.0])
+        np.testing.assert_array_equal(aligned_xyz[:, 2], [1.0, 1.0])
         assert (raw_total, filtered_total, aligned_total) == (3, 2, 2)
         np.testing.assert_array_equal(read_frame_matrix(raw.path, 1), initial_pose)
         with pytest.raises(ValueError, match="stage must be one of"):

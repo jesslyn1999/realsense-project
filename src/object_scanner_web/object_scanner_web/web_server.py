@@ -30,11 +30,6 @@ from object_scanner_processing.charuco_observations import (
     calibrate_charuco,
     CharucoCalibrationError,
     depth_image_to_meters,
-    validate_charuco_depth_consistency,
-)
-from object_scanner_processing.pointcloud_processing import (
-    CharucoPoseEvidence,
-    validate_sequential_charuco_capture,
 )
 from object_scanner_web.camera_frame import (
     build_camera_payload,
@@ -167,7 +162,6 @@ class RosControlBridge(Node):
         self._charuco_result: dict | None = None
         self._charuco_error: Exception | None = None
         self._last_charuco: dict | None = None
-        self._accepted_charuco_evidence: list[CharucoPoseEvidence] = []
         self._state = "stopped"
         self._database_path: str | None = None
         self._session_name: str | None = None
@@ -302,8 +296,6 @@ class RosControlBridge(Node):
                 if command == "start":
                     self._state = "recording"
                     self._database_path = response.message
-                    with self._transform_condition:
-                        self._accepted_charuco_evidence.clear()
                 elif command == "pause":
                     self._state = "paused"
                 elif command == "resume":
@@ -614,7 +606,6 @@ class RosControlBridge(Node):
     ) -> None:
         with self._transform_condition:
             capture_id = self._charuco_capture_id
-            prior_evidence = tuple(self._accepted_charuco_evidence)
         if capture_id is None:
             return
 
@@ -639,18 +630,6 @@ class RosControlBridge(Node):
                 np.asarray(camera_info.d, dtype=np.float64),
                 color_from_pointcloud,
             )
-            depth_consistency = validate_charuco_depth_consistency(
-                observation,
-                world_from_pointcloud,
-            )
-            pose_evidence = CharucoPoseEvidence(
-                matrix=world_from_pointcloud,
-                observation=observation,
-            )
-            sequential_metrics = validate_sequential_charuco_capture(
-                prior_evidence,
-                pose_evidence,
-            )
             transformation = TransformationMatrix(
                 name="charuco",
                 parent_frame_id="world",
@@ -671,8 +650,6 @@ class RosControlBridge(Node):
                 message="ChArUco pose accepted",
                 matrix=world_from_pointcloud.tolist(),
             )
-            capture.update(depth_consistency.as_dict())
-            capture.update(sequential_metrics.as_dict())
         except (CharucoCalibrationError, ValueError) as error:
             if isinstance(error, CharucoCalibrationError):
                 capture_error = error
@@ -691,7 +668,6 @@ class RosControlBridge(Node):
             if self._charuco_capture_id != capture_id:
                 return
             self._transform_publisher.publish(transform_message)
-            self._accepted_charuco_evidence.append(pose_evidence)
             self._charuco_result = capture
             self._last_charuco = capture
             self._charuco_capture_id = None
@@ -1245,6 +1221,8 @@ def create_app(
         response.headers["X-Charuco-Frames"] = str(
             result.charuco_frame_count
         )
+        if getattr(result, "quality_warning", None):
+            response.headers["X-Processing-Warning"] = result.quality_warning
         if result.charuco_reprojection_max_px is not None:
             response.headers["X-Charuco-Max-Reprojection-Px"] = str(
                 result.charuco_reprojection_max_px

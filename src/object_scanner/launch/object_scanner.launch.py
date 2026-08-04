@@ -8,6 +8,7 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    config = LaunchConfiguration("config")
     output_directory = LaunchConfiguration("output_directory")
     target_rgb = LaunchConfiguration("target_rgb")
     lab_threshold = LaunchConfiguration("lab_threshold")
@@ -21,7 +22,8 @@ def generate_launch_description():
                     "realsense_camera.launch.py",
                 ]
             )
-        )
+        ),
+        launch_arguments={"config": config}.items(),
     )
     scanner = Node(
         package="object_scanner",
@@ -41,6 +43,16 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "config",
+                default_value=PathJoinSubstitution(
+                    [
+                        FindPackageShare("realsense_camera_ros"),
+                        "config",
+                        "camera_d435i.json",
+                    ]
+                ),
+            ),
             DeclareLaunchArgument(
                 "output_directory",
                 default_value="scans",

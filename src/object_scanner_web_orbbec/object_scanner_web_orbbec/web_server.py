@@ -1116,6 +1116,8 @@ def create_app(
         response.headers["X-Charuco-Frames"] = str(
             result.charuco_frame_count
         )
+        if getattr(result, "quality_warning", None):
+            response.headers["X-Processing-Warning"] = result.quality_warning
         if result.charuco_reprojection_max_px is not None:
             response.headers["X-Charuco-Max-Reprojection-Px"] = str(
                 result.charuco_reprojection_max_px

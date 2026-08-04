@@ -13,8 +13,6 @@ import numpy as np
 from object_scanner_processing.charuco_observations import (
     board_points_opencv,
     board_points_world,
-    CharucoCalibrationError,
-    CharucoFrameObservation,
     MIN_CORNER_COUNT,
     WORLD_FROM_OPENCV_BOARD,
 )
@@ -35,6 +33,9 @@ RADIUS_NEIGHBORS = 8
 SOR_NEIGHBORS = 8
 SOR_STD_RATIO = 2.0
 MAX_FILTERED_FRACTION = 0.15
+BOARD_CLEARANCE_M = 0.002
+OBJECT_CLUSTER_EPS_M = 0.006
+OBJECT_CLUSTER_MIN_POINTS = 10
 OVERLAP_VOXEL_M = 0.003
 OVERLAP_DISTANCE_M = 0.012
 MIN_OVERLAP = 0.60
@@ -65,31 +66,6 @@ CHARUCO_CLOUD_ACCEPTANCE_FRACTION = 0.99
 
 class PointCloudProcessingError(RuntimeError):
     """Raised when a session cannot be refined without unsafe assumptions."""
-
-
-@dataclass(frozen=True)
-class CharucoPoseEvidence:
-    """One accepted capture used by the sequential corner-pose check."""
-
-    matrix: np.ndarray
-    observation: CharucoFrameObservation
-
-
-@dataclass(frozen=True)
-class SequentialCharucoMetrics:
-    """Capture-time correction required by prior ChArUco evidence."""
-
-    correction_m: float
-    correction_deg: float
-
-    def as_dict(self) -> dict:
-        """Return browser-facing correction metrics and safety limits."""
-        return {
-            "sequential_correction_mm": self.correction_m * 1000.0,
-            "sequential_correction_deg": self.correction_deg,
-            "sequential_translation_limit_mm": MAX_CORRECTION_M * 1000.0,
-            "sequential_rotation_limit_deg": MAX_CORRECTION_DEG,
-        }
 
 
 def _require_open3d() -> None:
@@ -181,6 +157,7 @@ class ProcessingResult:
     charuco_frames: tuple[CharucoFrameDiagnostics, ...] = ()
     charuco_corners: tuple[CharucoCornerDiagnostics, ...] = ()
     cloud_overlap_fraction_3mm: float | None = None
+    quality_warning: str | None = None
 
     @property
     def raw_points(self) -> int:
@@ -519,9 +496,7 @@ def _solve_hybrid_charuco_pose(
         raise PointCloudProcessingError(
             f"Frame {frame.id} corner solve moved "
             f"{correction_m * 1000.0:.2f} mm and "
-            f"{correction_deg:.3f} deg from its captured pose; maximums are "
-            f"{MAX_CORRECTION_M * 1000.0:.2f} mm and "
-            f"{MAX_CORRECTION_DEG:.3f} deg"
+            f"{correction_deg:.3f} deg from its captured pose"
         )
     return pose
 
@@ -562,58 +537,95 @@ def _sequential_charuco_poses(
     return tuple(poses)
 
 
-def validate_sequential_charuco_capture(
-    prior_evidence: tuple[CharucoPoseEvidence, ...],
-    candidate: CharucoPoseEvidence,
-) -> SequentialCharucoMetrics:
-    """Reject a capture whose corner solve exceeds offline safety limits."""
-    if not prior_evidence:
-        return SequentialCharucoMetrics(
-            correction_m=0.0,
-            correction_deg=0.0,
+def _fit_similarity_transform(
+    source: np.ndarray,
+    target: np.ndarray,
+    frame_id: int,
+) -> tuple[np.ndarray, float]:
+    """Fit the 3D scale and rigid correction indicated by board corners."""
+    source_center = source.mean(axis=0)
+    target_center = target.mean(axis=0)
+    source_zero = source - source_center
+    target_zero = target - target_center
+    source_variance = float(np.mean(np.sum(source_zero**2, axis=1)))
+    if source_variance <= np.finfo(np.float64).eps:
+        raise PointCloudProcessingError(
+            f"Frame {frame_id} ChArUco depth corners have no 3D extent"
         )
 
-    evidence = (*prior_evidence, candidate)
-    empty_xyz = np.empty((0, 3), dtype="<f4")
-    empty_rgb = np.empty((0, 3), dtype=np.uint8)
-    frames = [
-        RecordedFrame(
-            id=index + 1,
-            recorded_perf_counter_ns=0,
-            source_sec=0,
-            source_nanosec=0,
-            parent_frame_id="world",
-            transformation_name="charuco",
-            matrix=item.matrix,
-            xyz=empty_xyz,
-            rgb=empty_rgb,
-            charuco=item.observation,
-        )
-        for index, item in enumerate(evidence)
-    ]
-    try:
-        poses = _sequential_charuco_poses(frames)
-    except PointCloudProcessingError as error:
-        observation = candidate.observation
-        raise CharucoCalibrationError(
-            str(error),
-            corner_count=len(observation.corner_ids),
-            reprojection_rmse_px=(
-                observation.initial_reprojection_rmse_px
-            ),
-            valid_depth_corner_count=(
-                observation.valid_depth_corner_count
-            ),
-            invalid_depth_corner_count=(
-                observation.invalid_depth_corner_count
-            ),
-        ) from error
-
-    correction = _pose_delta(poses[-1], candidate.matrix)
-    return SequentialCharucoMetrics(
-        correction_m=float(np.linalg.norm(correction[:3, 3])),
-        correction_deg=_rotation_degrees(correction),
+    u, singular_values, vt = np.linalg.svd(
+        target_zero.T @ source_zero / len(source)
     )
+    signs = np.ones(3)
+    signs[-1] = np.sign(np.linalg.det(u @ vt))
+    rotation = u @ np.diag(signs) @ vt
+    scale = float(np.sum(singular_values * signs) / source_variance)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise PointCloudProcessingError(
+            f"Frame {frame_id} ChArUco depth scale is invalid: {scale}"
+        )
+
+    correction = np.eye(4)
+    correction[:3, :3] = scale * rotation
+    correction[:3, 3] = (
+        target_center - scale * rotation @ source_center
+    )
+    return correction, scale
+
+
+def _correct_charuco_depth_geometry(
+    recovered: list[tuple[RecordedFrame, np.ndarray]],
+) -> list[tuple[RecordedFrame, np.ndarray]]:
+    """Correct processed geometry from saved corners without changing raw data."""
+    corrected = []
+    for frame, camera_xyz in recovered:
+        if frame.transformation_name != "charuco":
+            corrected.append((frame, camera_xyz))
+            continue
+        observation = frame.charuco
+        if observation is None:
+            raise PointCloudProcessingError(
+                f"Frame {frame.id} has no persisted ChArUco corner observation"
+            )
+        valid = observation.depth_valid
+        expected_camera = _transform_points(
+            board_points_world(observation.corner_ids[valid]),
+            np.linalg.inv(frame.matrix),
+        )
+        correction, scale = _fit_similarity_transform(
+            observation.child_points[valid],
+            expected_camera,
+            frame.id,
+        )
+        corrected_camera = _transform_points(camera_xyz, correction)
+        corrected_child_points = observation.child_points.copy()
+        corrected_child_points[valid] = _transform_points(
+            corrected_child_points[valid],
+            correction,
+        )
+        corrected_observation = replace(
+            observation,
+            child_points=corrected_child_points,
+        )
+        residuals = np.linalg.norm(
+            corrected_child_points[valid] - expected_camera,
+            axis=1,
+        )
+        LOGGER.info(
+            "Frame %s ChArUco geometry correction: scale=%.6f "
+            "corner RMSE=%.3f mm max=%.3f mm",
+            frame.id,
+            scale,
+            math.sqrt(float(np.mean(residuals**2))) * 1000.0,
+            float(np.max(residuals)) * 1000.0,
+        )
+        corrected.append(
+            (
+                replace(frame, charuco=corrected_observation),
+                corrected_camera,
+            )
+        )
+    return corrected
 
 
 def _make_cloud(xyz: np.ndarray, rgb: np.ndarray) -> o3d.geometry.PointCloud:
@@ -650,12 +662,63 @@ def _estimate_normals(
         )
 
 
+def _isolate_main_object(
+    frame: RecordedFrame,
+    camera_xyz: np.ndarray,
+    initial_pose: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove the ChArUco plane and retain the largest 3D component."""
+    keep = np.ones(len(camera_xyz), dtype=bool)
+    if frame.transformation_name == "charuco":
+        initial_world_xyz = _transform_points(camera_xyz, initial_pose)
+        keep = initial_world_xyz[:, 2] > BOARD_CLEARANCE_M
+    candidate_xyz = camera_xyz[keep]
+    candidate_rgb = frame.rgb[keep]
+    if len(candidate_xyz) < OBJECT_CLUSTER_MIN_POINTS:
+        raise PointCloudProcessingError(
+            f"Frame {frame.id} has only {len(candidate_xyz)} points above the "
+            f"{BOARD_CLEARANCE_M * 1000.0:.1f} mm board clearance"
+        )
+
+    candidate_cloud = _make_cloud(candidate_xyz, candidate_rgb)
+    labels = np.asarray(
+        candidate_cloud.cluster_dbscan(
+            eps=OBJECT_CLUSTER_EPS_M,
+            min_points=OBJECT_CLUSTER_MIN_POINTS,
+            print_progress=False,
+        )
+    )
+    clustered = labels >= 0
+    if not np.any(clustered):
+        raise PointCloudProcessingError(
+            f"Frame {frame.id} has no connected object with at least "
+            f"{OBJECT_CLUSTER_MIN_POINTS} points within "
+            f"{OBJECT_CLUSTER_EPS_M * 1000.0:.1f} mm"
+        )
+    component_sizes = np.bincount(labels[clustered])
+    main_component = int(np.argmax(component_sizes))
+    object_mask = labels == main_component
+    LOGGER.info(
+        "Frame %s object isolation: input=%s above_board=%s object=%s",
+        frame.id,
+        len(frame.xyz),
+        len(candidate_xyz),
+        int(np.sum(object_mask)),
+    )
+    return candidate_xyz[object_mask], candidate_rgb[object_mask]
+
+
 def _clean_frame(
     frame: RecordedFrame,
     camera_xyz: np.ndarray,
     initial_pose: np.ndarray,
 ) -> _PreparedFrame:
-    cloud = _make_cloud(camera_xyz, frame.rgb)
+    object_xyz, object_rgb = _isolate_main_object(
+        frame,
+        camera_xyz,
+        initial_pose,
+    )
+    cloud = _make_cloud(object_xyz, object_rgb)
     voxel_cloud = cloud.voxel_down_sample(VOXEL_SIZE_M)
     voxel_points = len(voxel_cloud.points)
     if voxel_points < SOR_NEIGHBORS + 1:
@@ -960,15 +1023,22 @@ def _register_edge(
     correction_deg = _rotation_degrees(correction)
     rmse_before = float(initial_evaluation.inlier_rmse)
     rmse_after = float(final_evaluation.inlier_rmse)
+    accepted_reason = "accepted"
+    if rmse_after > rmse_before + 1e-6:
+        accepted_reason = (
+            "accepted initial ChArUco alignment because ICP worsened RMSE "
+            f"from {rmse_before * 1000.0:.2f} to "
+            f"{rmse_after * 1000.0:.2f} mm"
+        )
+        transformation = initial
+        overlap_after = overlap_before
+        rmse_after = rmse_before
+        correction_m = 0.0
+        correction_deg = 0.0
 
     reasons = []
     if overlap_after < MIN_OVERLAP:
         reasons.append(f"overlap {overlap_after:.1%} is below 60%")
-    if rmse_after > rmse_before + 1e-6:
-        reasons.append(
-            f"RMSE worsened ({rmse_before * 1000.0:.2f} to "
-            f"{rmse_after * 1000.0:.2f} mm)"
-        )
     if correction_m > MAX_CORRECTION_M:
         reasons.append(
             f"translation correction {correction_m * 1000.0:.2f} mm "
@@ -990,7 +1060,7 @@ def _register_edge(
         rmse_after_m=rmse_after,
         correction_m=correction_m,
         correction_deg=correction_deg,
-        reason="accepted" if accepted else "; ".join(reasons),
+        reason=accepted_reason if accepted else "; ".join(reasons),
     )
     if not accepted:
         return None, diagnostics
@@ -1274,6 +1344,7 @@ def _validate_charuco_acceptance(
     prepared: list[_PreparedFrame],
     poses: tuple[np.ndarray, ...],
     edges: list[_AcceptedEdge],
+    aligned_world_xyz: list[np.ndarray],
 ) -> tuple[
     tuple[CharucoFrameDiagnostics, ...],
     tuple[CharucoCornerDiagnostics, ...],
@@ -1285,14 +1356,8 @@ def _validate_charuco_acceptance(
     per_frame_cloud_fractions = [[] for _ in prepared]
     all_cloud_fractions = []
     for edge in edges:
-        source_world = _transform_points(
-            prepared[edge.source_index].camera_xyz,
-            poses[edge.source_index],
-        )
-        target_world = _transform_points(
-            prepared[edge.target_index].camera_xyz,
-            poses[edge.target_index],
-        )
+        source_world = aligned_world_xyz[edge.source_index]
+        target_world = aligned_world_xyz[edge.target_index]
         distances = _mutual_overlap_distances(source_world, target_world)
         if len(distances) < SOR_NEIGHBORS + 1:
             raise PointCloudProcessingError(
@@ -1554,14 +1619,20 @@ def _fuse_voxels(
     return fused_xyz, fused_rgb, observation_counts
 
 
-def _process_frames(frames: list[RecordedFrame]) -> ProcessingResult:
+def _process_frames(
+    frames: list[RecordedFrame],
+    allow_degraded_quality: bool,
+) -> ProcessingResult:
     if len({frame.id for frame in frames}) != len(frames):
         raise PointCloudProcessingError(
             "Captured frame IDs must be unique"
         )
     frames = sorted(frames, key=lambda frame: frame.id)
-    recovered = _validate_and_recover(frames)
-    initial_poses = _sequential_charuco_poses(frames)
+    recovered = _correct_charuco_depth_geometry(
+        _validate_and_recover(frames)
+    )
+    processed_frames = [frame for frame, _ in recovered]
+    initial_poses = _sequential_charuco_poses(processed_frames)
     prepared = [
         _clean_frame(frame, camera_xyz, initial_pose)
         for (frame, camera_xyz), initial_pose in zip(
@@ -1609,17 +1680,44 @@ def _process_frames(frames: list[RecordedFrame]) -> ProcessingResult:
         accepted_edges,
         edge_diagnostics,
     )
-    _validate_optimized_edges(prepared, poses, accepted_edges)
-    (
-        charuco_frame_diagnostics,
-        charuco_corner_diagnostics,
-        cloud_overlap_fraction_3mm,
-    ) = _validate_charuco_acceptance(prepared, poses, accepted_edges)
+    try:
+        _validate_optimized_edges(prepared, poses, accepted_edges)
+    except PointCloudProcessingError as error:
+        LOGGER.warning(
+            "%s; using corrected ChArUco poses instead",
+            error,
+        )
+        poses = tuple(frame.initial_pose.copy() for frame in prepared)
+        _validate_optimized_edges(prepared, poses, accepted_edges)
     xyz_parts, rgb_parts, frame_diagnostics = _temporal_filter(
         prepared,
         poses,
         accepted_edges,
     )
+    quality_warning = None
+    try:
+        (
+            charuco_frame_diagnostics,
+            charuco_corner_diagnostics,
+            cloud_overlap_fraction_3mm,
+        ) = _validate_charuco_acceptance(
+            prepared,
+            poses,
+            accepted_edges,
+            xyz_parts,
+        )
+    except PointCloudProcessingError as error:
+        if not allow_degraded_quality:
+            raise
+        quality_warning = str(error)
+        LOGGER.warning(
+            "Saving best-effort aligned output without strict ChArUco "
+            "acceptance metrics: %s",
+            quality_warning,
+        )
+        charuco_frame_diagnostics = ()
+        charuco_corner_diagnostics = ()
+        cloud_overlap_fraction_3mm = None
     fused_xyz, fused_rgb, observation_counts = _fuse_voxels(
         xyz_parts,
         rgb_parts,
@@ -1655,16 +1753,21 @@ def _process_frames(frames: list[RecordedFrame]) -> ProcessingResult:
         charuco_frames=charuco_frame_diagnostics,
         charuco_corners=charuco_corner_diagnostics,
         cloud_overlap_fraction_3mm=cloud_overlap_fraction_3mm,
+        quality_warning=quality_warning,
     )
     LOGGER.info("Point-cloud refinement complete: %s", result.summary)
     return result
 
 
-def process_frames(frames: list[RecordedFrame]) -> ProcessingResult:
+def process_frames(
+    frames: list[RecordedFrame],
+    *,
+    allow_degraded_quality: bool = False,
+) -> ProcessingResult:
     """Validate, register, and fuse complete recorded frames."""
     _require_open3d()
     try:
-        return _process_frames(frames)
+        return _process_frames(frames, allow_degraded_quality)
     except PointCloudProcessingError:
         raise
     except RuntimeError as error:
@@ -1673,6 +1776,13 @@ def process_frames(frames: list[RecordedFrame]) -> ProcessingResult:
         ) from error
 
 
-def process_recording(database_path: Path) -> ProcessingResult:
+def process_recording(
+    database_path: Path,
+    *,
+    allow_degraded_quality: bool = False,
+) -> ProcessingResult:
     """Process one SQLite recording without writing to it."""
-    return process_frames(read_frames(database_path))
+    return process_frames(
+        read_frames(database_path),
+        allow_degraded_quality=allow_degraded_quality,
+    )

@@ -113,6 +113,7 @@ const CHARUCO_PREVIEW_INTERVAL_MS = 200;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1000);
+camera.up.set(0, 0, 1);
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -188,7 +189,9 @@ const pointRaycaster = new THREE.Raycaster();
 pointRaycaster.params.Points.threshold = POINT_PICK_THRESHOLD_M;
 const pointPointer = new THREE.Vector2();
 const hoveredPoint = new THREE.Vector3();
-scene.add(new THREE.GridHelper(2, 20, 0x5d8fdc, 0x3b4554));
+const grid = new THREE.GridHelper(2, 20, 0x5d8fdc, 0x3b4554);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
 const axesHelper = new THREE.AxesHelper(0.25);
 axesHelper.setColors(0xe66b70, 0x5d8fdc, 0x9a7bdc);
 scene.add(axesHelper);
@@ -714,9 +717,12 @@ async function loadPoints() {
       ? ` ChArUco max ${charucoMax.toFixed(3)} px; ` +
         `${(cloudFraction * 100).toFixed(3)}% within 3 mm.`
       : "";
+  const processingWarning = response.headers.get("X-Processing-Warning");
   setMessage(
-    `Showing cleaned, registered preview (${acceptedEdges} edges accepted, ` +
+    (processingWarning ? `${processingWarning} ` : "") +
+      `Showing cleaned, registered preview (${acceptedEdges} edges accepted, ` +
       `${rejectedEdges} rejected).${charucoMetrics}`,
+    Boolean(processingWarning),
   );
 }
 

@@ -17,8 +17,6 @@ DEPTH_WINDOW_RADIUS_PX = 2
 MIN_DEPTH_INLIERS = 9
 DEPTH_MAD_SCALE = 3.0
 MIN_DEPTH_TOLERANCE_M = 0.001
-DEPTH_CONSISTENCY_MEDIAN_LIMIT_M = 0.005
-DEPTH_CONSISTENCY_P95_LIMIT_M = 0.010
 
 _DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 _BOARD = cv2.aruco.CharucoBoard(
@@ -123,27 +121,6 @@ class CharucoFrameObservation:
             "valid_depth_corner_count": self.valid_depth_corner_count,
             "invalid_depth_corner_count": self.invalid_depth_corner_count,
             "invalid_depth_reasons": reason_counts,
-        }
-
-
-@dataclass(frozen=True)
-class CharucoDepthConsistency:
-    """Capture-time agreement between 2D board pose and sampled depth."""
-
-    median_error_m: float
-    p95_error_m: float
-
-    def as_dict(self) -> dict:
-        """Return browser-facing consistency metrics in millimeters."""
-        return {
-            "depth_consistency_median_mm": self.median_error_m * 1000.0,
-            "depth_consistency_p95_mm": self.p95_error_m * 1000.0,
-            "depth_consistency_median_limit_mm": (
-                DEPTH_CONSISTENCY_MEDIAN_LIMIT_M * 1000.0
-            ),
-            "depth_consistency_p95_limit_mm": (
-                DEPTH_CONSISTENCY_P95_LIMIT_M * 1000.0
-            ),
         }
 
 
@@ -262,55 +239,6 @@ def board_points_world(corner_ids: np.ndarray) -> np.ndarray:
     """Return exact scanner-world board points for corner IDs."""
     points = board_points_opencv(corner_ids)
     return points @ WORLD_FROM_OPENCV_BOARD[:3, :3].T
-
-
-def validate_charuco_depth_consistency(
-    observation: CharucoFrameObservation,
-    world_from_child: np.ndarray,
-) -> CharucoDepthConsistency:
-    """Reject a capture when its sampled depth disagrees with its 2D pose."""
-    matrix = np.asarray(world_from_child, dtype=np.float64)
-    if (
-        matrix.shape != (4, 4)
-        or not np.isfinite(matrix).all()
-        or not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0])
-    ):
-        raise ValueError("world_from_child must be a finite 4x4 transform")
-
-    valid = observation.depth_valid
-    observed_world = (
-        observation.child_points[valid] @ matrix[:3, :3].T
-        + matrix[:3, 3]
-    )
-    expected_world = board_points_world(observation.corner_ids[valid])
-    errors_m = np.linalg.norm(observed_world - expected_world, axis=1)
-    consistency = CharucoDepthConsistency(
-        median_error_m=float(np.median(errors_m)),
-        p95_error_m=float(np.percentile(errors_m, 95)),
-    )
-    if (
-        consistency.median_error_m > DEPTH_CONSISTENCY_MEDIAN_LIMIT_M
-        or consistency.p95_error_m > DEPTH_CONSISTENCY_P95_LIMIT_M
-    ):
-        raise CharucoCalibrationError(
-            "ChArUco depth consistency failed: median corner error "
-            f"{consistency.median_error_m * 1000.0:.2f} mm "
-            f"(maximum {DEPTH_CONSISTENCY_MEDIAN_LIMIT_M * 1000.0:.2f} mm), "
-            "95th percentile "
-            f"{consistency.p95_error_m * 1000.0:.2f} mm "
-            f"(maximum {DEPTH_CONSISTENCY_P95_LIMIT_M * 1000.0:.2f} mm)",
-            corner_count=len(observation.corner_ids),
-            reprojection_rmse_px=(
-                observation.initial_reprojection_rmse_px
-            ),
-            valid_depth_corner_count=(
-                observation.valid_depth_corner_count
-            ),
-            invalid_depth_corner_count=(
-                observation.invalid_depth_corner_count
-            ),
-        )
-    return consistency
 
 
 def calibrate_charuco(

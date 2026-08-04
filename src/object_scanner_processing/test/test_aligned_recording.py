@@ -187,6 +187,19 @@ def test_writes_compatible_frames_and_reads_fused_cloud(tmp_path):
     )
 
 
+def test_persists_best_effort_quality_warning(tmp_path):
+    raw_path = _raw_database(tmp_path)
+    result = replace(
+        _processing_result(2),
+        quality_warning="Only 97.5% of correspondences are within 3 mm",
+    )
+
+    aligned_path = write_aligned_recording(raw_path, result)
+    fused = read_fused_cloud(aligned_path, source_revision(raw_path))
+
+    assert fused.quality_warning == result.quality_warning
+
+
 def test_persists_and_reads_charuco_acceptance_diagnostics(tmp_path):
     raw_path = _raw_database(tmp_path)
     result = _processing_result(2)
@@ -331,7 +344,8 @@ def test_processing_failure_preserves_previous_complete_result(
     original_result = _processing_result(2)
     aligned_path = write_aligned_recording(raw_path, original_result)
 
-    def reject_processing(_raw_path):
+    def reject_processing(_raw_path, *, allow_degraded_quality):
+        assert allow_degraded_quality
         raise PointCloudProcessingError("registration graph is weak")
 
     monkeypatch.setattr(

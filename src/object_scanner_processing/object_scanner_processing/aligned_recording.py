@@ -49,6 +49,7 @@ class FusedAlignedCloud:
     charuco_frame_count: int
     charuco_reprojection_max_px: float | None
     cloud_overlap_fraction_3mm: float | None
+    quality_warning: str | None
 
 
 def aligned_database_path(raw_database_path: Path) -> Path:
@@ -335,6 +336,7 @@ def _prepared_rows(
             "" if result.cloud_overlap_fraction_3mm is None
             else str(result.cloud_overlap_fraction_3mm)
         ),
+        "quality_warning": result.quality_warning or "",
     }
     return (
         frame_rows,
@@ -590,7 +592,10 @@ def write_aligned_recording(
 def generate_aligned_recording(raw_database_path: Path) -> Path:
     """Run the full pipeline and transactionally persist its derived result."""
     raw_path = Path(raw_database_path)
-    return write_aligned_recording(raw_path, process_recording(raw_path))
+    return write_aligned_recording(
+        raw_path,
+        process_recording(raw_path, allow_degraded_quality=True),
+    )
 
 
 def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
@@ -685,6 +690,7 @@ def read_fused_cloud(
             if not metadata["cloud_overlap_fraction_3mm"]
             else float(metadata["cloud_overlap_fraction_3mm"])
         )
+        quality_warning = metadata.get("quality_warning") or None
     except (KeyError, ValueError) as error:
         raise AlignedRecordingError(
             "Aligned recording contains invalid processing metrics"
@@ -741,4 +747,5 @@ def read_fused_cloud(
         charuco_frame_count=charuco_frame_count,
         charuco_reprojection_max_px=charuco_reprojection_max_px,
         cloud_overlap_fraction_3mm=cloud_overlap_fraction_3mm,
+        quality_warning=quality_warning,
     )
