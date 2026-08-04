@@ -296,6 +296,7 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert b'id="analysis-rotate-button"' in page.data
         assert b'id="analysis-scale-button"' in page.data
         assert b'id="analysis-apply-button"' in page.data
+        assert b'id="analysis-save-button"' in page.data
         assert b'id="replay-previous-button"' in page.data
         assert b'id="replay-next-button"' in page.data
         assert b'id="replay-exit-button"' in page.data
@@ -790,6 +791,7 @@ def test_demo5_repair_reference_and_analysis_routes(tmp_path, monkeypatch):
     assert automatic.json["point_count"] == 1
     assert automatic.json["points"] == pytest.approx([0.1, -0.2, 0.08])
     assert automatic.json["scale_m_per_stl_unit"] == 0.0057
+    assert automatic.json["placement_source"] == "default"
     assert calls[0] == (aligned_path, repair_path, None)
 
     refined_transform = np.eye(4)
@@ -799,8 +801,27 @@ def test_demo5_repair_reference_and_analysis_routes(tmp_path, monkeypatch):
         json={"transform": refined_transform.tolist()},
     )
     assert refined.status_code == 200
+    assert refined.json["placement_source"] == "adjusted"
     np.testing.assert_allclose(refined.json["transform"], refined_transform)
     np.testing.assert_allclose(calls[1][2], refined_transform)
+
+    saved = client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": refined_transform.tolist(), "save": True},
+    )
+    assert saved.status_code == 200
+    assert saved.json["placement_source"] == "saved"
+    placement_path = database_path.parent / "repair_placement.json"
+    placement = json.loads(placement_path.read_text())
+    np.testing.assert_allclose(placement["transform"], refined_transform)
+
+    restored = client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": None},
+    )
+    assert restored.status_code == 200
+    assert restored.json["placement_source"] == "saved"
+    np.testing.assert_allclose(calls[-1][2], refined_transform)
 
     assert client.post(
         "/api/sessions/demo5/repair-analysis",
@@ -809,6 +830,14 @@ def test_demo5_repair_reference_and_analysis_routes(tmp_path, monkeypatch):
     assert client.post(
         "/api/sessions/demo5/repair-analysis",
         json={"transform": [[1.0]]},
+    ).status_code == 400
+    assert client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": None, "save": True},
+    ).status_code == 400
+    assert client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": refined_transform.tolist(), "save": "yes"},
     ).status_code == 400
     assert client.post(
         "/api/sessions/other/repair-analysis",

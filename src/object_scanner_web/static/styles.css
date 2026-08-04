@@ -765,10 +765,15 @@ h2 {
   display: none;
 }
 
-.analysis-mode-controls,
-.analysis-dock-controls {
+.analysis-mode-controls {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+}
+
+.analysis-dock-controls {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 7px;
 }
 

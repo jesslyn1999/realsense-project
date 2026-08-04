@@ -1066,16 +1066,51 @@ def create_app(
             if not isinstance(body, dict) or "transform" not in body:
                 raise ValueError("JSON body must contain transform")
             transform = body["transform"]
+            save = body.get("save", False)
+            if not isinstance(save, bool):
+                raise ValueError("save must be a boolean")
+            if save and transform is None:
+                raise ValueError("A current transform is required when saving")
+
+            placement_path = database_path.parent / "repair_placement.json"
+            placement_source = "adjusted"
+            if transform is None:
+                placement_source = "default"
+                if placement_path.is_file():
+                    saved = json.loads(placement_path.read_text(encoding="utf-8"))
+                    if not isinstance(saved, dict) or "transform" not in saved:
+                        raise ValueError(
+                            "Saved repair placement must contain transform"
+                        )
+                    transform = saved["transform"]
+                    placement_source = "saved"
             result = segment_repair(
                 aligned_path,
                 repair_stl_path,
                 None if transform is None else np.asarray(transform),
             )
+            if save:
+                temporary_path = placement_path.with_suffix(".json.tmp")
+                temporary_path.write_text(
+                    json.dumps(
+                        {"transform": result.transform.tolist()},
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                temporary_path.replace(placement_path)
+                placement_source = "saved"
         except ValueError as error:
             return jsonify(success=False, message=str(error)), 400
         except FileNotFoundError as error:
             return jsonify(success=False, message=str(error)), 404
-        except (AlignedRecordingError, RuntimeError, sqlite3.Error) as error:
+        except (
+            AlignedRecordingError,
+            OSError,
+            RuntimeError,
+            sqlite3.Error,
+        ) as error:
             app.logger.exception("Repair analysis failed: %s", error)
             return jsonify(success=False, message=str(error)), 500
         return jsonify(
@@ -1084,6 +1119,7 @@ def create_app(
             points=result.xyz.reshape(-1).tolist(),
             point_count=len(result.xyz),
             scale_m_per_stl_unit=result.scale_m_per_stl_unit,
+            placement_source=placement_source,
         )
 
     @app.get("/api/sessions/<session_name>/frames")

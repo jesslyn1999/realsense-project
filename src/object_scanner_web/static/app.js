@@ -22,6 +22,7 @@ const analysisSegmentVisible = document.querySelector(
   "#analysis-segment-visible",
 );
 const analysisApplyButton = document.querySelector("#analysis-apply-button");
+const analysisSaveButton = document.querySelector("#analysis-save-button");
 const analysisCancelButton = document.querySelector("#analysis-cancel-button");
 const analysisResetButton = document.querySelector("#analysis-reset-button");
 const analysisModeButtons = {
@@ -425,6 +426,7 @@ function updateControls(busy = false) {
     busy || currentState !== "stopped" || repairTransform === null;
   const analysisDisabled = busy || repairMesh === null;
   analysisApplyButton.disabled = analysisDisabled;
+  analysisSaveButton.disabled = analysisDisabled;
   analysisCancelButton.disabled = analysisDisabled;
   analysisResetButton.disabled =
     analysisDisabled || repairInitialTransform === null;
@@ -1158,14 +1160,14 @@ async function showRepairEditor(transform) {
   updateControls();
 }
 
-async function requestRepairAnalysis(transform) {
+async function requestRepairAnalysis(transform, save = false) {
   const sessionName = savedSessionSelect.value;
   const response = await fetch(
     `/api/sessions/${encodeURIComponent(sessionName)}/repair-analysis`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ transform }),
+      body: JSON.stringify({ transform, save }),
     },
   );
   const result = await response.json();
@@ -1206,11 +1208,14 @@ async function analyzeRepair() {
     repairEditing = false;
     analysisEditControls.hidden = true;
     analysisDock.hidden = false;
+    const placementLabel =
+      result.placement_source === "saved" ? "saved" : "original";
     analysisStatus.textContent =
-      `${result.point_count.toLocaleString()} original repair-region points.`;
+      `${result.point_count.toLocaleString()} ${placementLabel} ` +
+      "repair-region points.";
     setMessage(
-      `Showing ${result.point_count.toLocaleString()} original segmented ` +
-        "repair-region points.",
+      `Showing ${result.point_count.toLocaleString()} ${placementLabel} ` +
+        "segmented repair-region points.",
     );
   } catch (error) {
     clearRepairAnalysis();
@@ -1228,23 +1233,31 @@ async function adjustRepair() {
   await showRepairEditor(repairTransform);
 }
 
-async function applyRepairPlacement() {
+async function updateRepairPlacement(save) {
   if (repairMesh === null) {
     return;
   }
   analysisBusy = true;
   updateControls();
-  setMessage("Updating the repair segmentation from the adjusted placement…");
+  setMessage(
+    save
+      ? "Applying and saving the current repair placement…"
+      : "Updating the repair segmentation from the adjusted placement…",
+  );
   try {
-    const result = await requestRepairAnalysis(repairMatrixRows());
+    const result = await requestRepairAnalysis(repairMatrixRows(), save);
     setRepairPointOverlay(result.points);
     repairTransform = result.transform.map((row) => [...row]);
     hideRepairEditor();
     analysisStatus.textContent =
-      `${result.point_count.toLocaleString()} adjusted repair-region points.`;
+      `${result.point_count.toLocaleString()} ` +
+      `${save ? "saved" : "adjusted"} repair-region points.`;
     setMessage(
-      `Repair placement applied; ` +
-        `${result.point_count.toLocaleString()} scan points selected.`,
+      save
+        ? `Repair placement saved in scans/${REPAIR_SESSION}/` +
+            "repair_placement.json."
+        : `Repair placement applied; ` +
+            `${result.point_count.toLocaleString()} scan points selected.`,
     );
   } catch (error) {
     setMessage(error.message, true);
@@ -1252,6 +1265,14 @@ async function applyRepairPlacement() {
     analysisBusy = false;
     updateControls();
   }
+}
+
+function applyRepairPlacement() {
+  return updateRepairPlacement(false);
+}
+
+function saveRepairPlacement() {
+  return updateRepairPlacement(true);
 }
 
 function resetRepairPlacement() {
@@ -1936,6 +1957,7 @@ adjustRepairButton.addEventListener("click", () => {
   adjustRepair().catch((error) => setMessage(error.message, true));
 });
 analysisApplyButton.addEventListener("click", applyRepairPlacement);
+analysisSaveButton.addEventListener("click", saveRepairPlacement);
 analysisCancelButton.addEventListener("click", () => {
   cancelRepairAdjustment().catch((error) => setMessage(error.message, true));
 });
