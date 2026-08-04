@@ -8,39 +8,73 @@ import time
 
 from ament_index_python.packages import get_package_share_directory
 from flask import Flask, jsonify, render_template, request, Response
+import message_filters
+import numpy as np
+from object_scanner.pointcloud import transform_to_matrix
 from object_scanner.sqlite_recording import validated_session_name
 from object_scanner.transformations import (
     load_transformation_matrices,
     transformation_to_message,
+    TransformationMatrix,
 )
 from object_scanner_interfaces.msg import NamedTransform
-from object_scanner_web.camera_frame import build_camera_payload
+from object_scanner_processing.aligned_recording import (
+    aligned_database_path,
+    AlignedRecordingError,
+    read_fused_cloud,
+    source_revision,
+)
+from object_scanner_processing.charuco_observations import (
+    annotate_charuco,
+    build_charuco_observation,
+    calibrate_charuco,
+    CharucoCalibrationError,
+    depth_image_to_meters,
+)
+from object_scanner_web.camera_frame import (
+    build_camera_payload,
+    build_rgb_payload,
+    image_to_rgb,
+)
 from object_scanner_web.sqlite_reader import (
-    build_frame_payload,
-    build_point_payload,
+    build_array_payload,
+    build_replay_frame_payload,
     list_frames,
     PAYLOAD_HEADER,
+    REPLAY_STAGES,
 )
 import rclpy
+from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, PointCloud2
+from rclpy.qos import qos_profile_sensor_data, QoSProfile
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from std_srvs.srv import Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 HOST = "0.0.0.0"
 PORT = 5000
 MAX_DISPLAY_POINTS = 250_000
 SERVICE_TIMEOUT_S = 5.0
+ALIGNMENT_TIMEOUT_S = 600.0
 CAMERA_TIMEOUT_S = 5.0
 COLOR_TOPIC = "/realsense/camera0/color/image_raw"
+COLOR_CAMERA_INFO_TOPIC = "/realsense/camera0/color/camera_info"
+REGISTERED_DEPTH_TOPIC = (
+    "/realsense/camera0/aligned_depth_to_color/image_raw"
+)
 POINTCLOUD_TOPIC = "/realsense/camera0/depth/color/points"
 TRANSFORM_TOPIC = "/object_scanner/camera_to_world"
 TRANSFORM_BURST_COUNT = 1
 TRANSFORM_TIMEOUT_S = 5.0
+TF_TIMEOUT_S = 0.5
+SENSOR_SYNC_QUEUE_SIZE = 30
+SENSOR_SYNC_SLOP_S = 0.05
+TRANSFORMATION_MODES = {"json", "charuco"}
 STATUS_SERVICE = "/object_scanner/recording_status"
 SERVICE_NAMES = {
     "start": "/object_scanner/start_recording",
@@ -48,6 +82,33 @@ SERVICE_NAMES = {
     "resume": "/object_scanner/resume_recording",
     "stop": "/object_scanner/stop_recording",
 }
+
+
+def _attach_charuco_observation(message, observation) -> None:
+    target = message.charuco_observation
+    target.corner_ids = observation.corner_ids.tolist()
+    target.image_points = observation.image_points.reshape(-1).tolist()
+    target.depth_valid = observation.depth_valid.tolist()
+    target.child_points = observation.child_points.reshape(-1).tolist()
+    target.depth_valid_pixel_counts = (
+        observation.depth_valid_pixel_counts.tolist()
+    )
+    target.depth_inlier_pixel_counts = (
+        observation.depth_inlier_pixel_counts.tolist()
+    )
+    target.depth_mad_m = observation.depth_mad_m.tolist()
+    target.depth_invalid_reasons = list(observation.depth_invalid_reasons)
+    target.camera_matrix = observation.camera_matrix.reshape(-1).tolist()
+    target.distortion = observation.distortion.tolist()
+    target.color_from_child = (
+        observation.color_from_child.reshape(-1).tolist()
+    )
+    target.initial_reprojection_errors_px = (
+        observation.initial_reprojection_errors_px.tolist()
+    )
+    target.initial_reprojection_rmse_px = (
+        observation.initial_reprojection_rmse_px
+    )
 
 
 def validated_rgb(value) -> list[int]:
@@ -64,6 +125,12 @@ def validated_rgb(value) -> list[int]:
     ):
         raise ValueError("rgb must contain three integer values from 0 to 255")
     return list(value)
+
+
+def validated_transformation_mode(value) -> str:
+    if value not in TRANSFORMATION_MODES:
+        raise ValueError("mode must be 'json' or 'charuco'")
+    return value
 
 
 class RosControlBridge(Node):
@@ -85,9 +152,15 @@ class RosControlBridge(Node):
         self._transformations = load_transformation_matrices(
             transformation_path
         )
+        self._transformation_mode = "json"
         self._transformation_index = 0
         self._active_transformation = None
         self._remaining_transform_messages = 0
+        self._next_charuco_capture_id = 1
+        self._charuco_capture_id: int | None = None
+        self._charuco_result: dict | None = None
+        self._charuco_error: Exception | None = None
+        self._last_charuco: dict | None = None
         self._state = "stopped"
         self._database_path: str | None = None
         self._session_name: str | None = None
@@ -108,21 +181,53 @@ class RosControlBridge(Node):
         self._image_condition = threading.Condition()
         self._capture_armed = False
         self._captured_image: Image | None = None
-        self._image_subscription = self.create_subscription(
+        self._latest_color_image: Image | None = None
+        self._image_subscriber = message_filters.Subscriber(
+            self,
             Image,
             COLOR_TOPIC,
-            self._on_color_image,
-            qos_profile_sensor_data,
+            qos_profile=qos_profile_sensor_data,
         )
+        self._image_subscriber.registerCallback(self._on_color_image)
+        self._pointcloud_subscriber = message_filters.Subscriber(
+            self,
+            PointCloud2,
+            POINTCLOUD_TOPIC,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._pointcloud_subscriber.registerCallback(self._on_pointcloud)
+        self._depth_subscriber = message_filters.Subscriber(
+            self,
+            Image,
+            REGISTERED_DEPTH_TOPIC,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._camera_info_subscriber = message_filters.Subscriber(
+            self,
+            CameraInfo,
+            COLOR_CAMERA_INFO_TOPIC,
+            qos_profile=QoSProfile(depth=1),
+        )
+        self._sensor_synchronizer = (
+            message_filters.ApproximateTimeSynchronizer(
+                [
+                    self._pointcloud_subscriber,
+                    self._image_subscriber,
+                    self._depth_subscriber,
+                    self._camera_info_subscriber,
+                ],
+                queue_size=SENSOR_SYNC_QUEUE_SIZE,
+                slop=SENSOR_SYNC_SLOP_S,
+            )
+        )
+        self._sensor_synchronizer.registerCallback(
+            self._on_synchronized_sensor_frame
+        )
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
         self._transform_publisher = self.create_publisher(
             NamedTransform,
             TRANSFORM_TOPIC,
-            qos_profile_sensor_data,
-        )
-        self._pointcloud_subscription = self.create_subscription(
-            PointCloud2,
-            POINTCLOUD_TOPIC,
-            self._on_pointcloud,
             qos_profile_sensor_data,
         )
 
@@ -175,6 +280,11 @@ class RosControlBridge(Node):
             response = self._wait_for_future(
                 future,
                 SERVICE_NAMES[command],
+                (
+                    ALIGNMENT_TIMEOUT_S
+                    if command in {"pause", "stop"}
+                    else SERVICE_TIMEOUT_S
+                ),
             )
             if response is None:
                 raise RuntimeError(
@@ -191,6 +301,8 @@ class RosControlBridge(Node):
                     self._state = "recording"
                 elif command == "stop":
                     self._state = "stopped"
+            elif command in {"pause", "stop"}:
+                self._refresh_scanner_status_unlocked()
 
             result = self._status_unlocked()
             result.update(
@@ -219,6 +331,34 @@ class RosControlBridge(Node):
             result.update(
                 success=bool(parameter_result.successful),
                 message=parameter_result.reason or "Reference color updated",
+            )
+            return result
+
+    def set_transformation_mode(self, mode: str) -> dict:
+        selected_mode = validated_transformation_mode(mode)
+        with self._lock:
+            self._refresh_scanner_status_unlocked()
+            if self._state != "stopped":
+                result = self._status_unlocked()
+                result.update(
+                    success=False,
+                    message="Transformation mode can change only while stopped",
+                )
+                return result
+            with self._transform_condition:
+                transformation_active = self._transformation_active_unlocked()
+                if not transformation_active:
+                    self._transformation_mode = selected_mode
+            result = self._status_unlocked()
+            if transformation_active:
+                result.update(
+                    success=False,
+                    message="A transformation capture is already active",
+                )
+                return result
+            result.update(
+                success=True,
+                message=f"Transformation mode set to {selected_mode}",
             )
             return result
 
@@ -284,7 +424,12 @@ class RosControlBridge(Node):
     ) -> dict:
         """Publish the displayed matrix for the next point cloud."""
         with self._transform_condition:
-            if self._remaining_transform_messages:
+            if self._transformation_mode != "json":
+                raise RuntimeError(
+                    "JSON transformation publishing is unavailable "
+                    "in ChArUco mode"
+                )
+            if self._transformation_active_unlocked():
                 raise RuntimeError("A transformation burst is already active")
 
             transformation = self._current_transformation_unlocked()
@@ -319,7 +464,12 @@ class RosControlBridge(Node):
         if isinstance(delta, bool) or delta not in {-1, 1}:
             raise ValueError("delta must be -1 or 1")
         with self._transform_condition:
-            if self._remaining_transform_messages:
+            if self._transformation_mode != "json":
+                raise RuntimeError(
+                    "JSON transformation selection is unavailable "
+                    "in ChArUco mode"
+                )
+            if self._transformation_active_unlocked():
                 raise RuntimeError("A transformation burst is already active")
             self._transformation_index = (
                 self._transformation_index + delta
@@ -348,11 +498,80 @@ class RosControlBridge(Node):
 
     def _on_color_image(self, message: Image) -> None:
         with self._image_condition:
+            self._latest_color_image = message
             if not self._capture_armed:
                 return
             self._captured_image = message
             self._capture_armed = False
             self._image_condition.notify_all()
+
+    def build_charuco_preview(self) -> np.ndarray:
+        with self._transform_condition:
+            if self._transformation_mode != "charuco":
+                raise RuntimeError(
+                    "ChArUco preview is unavailable in JSON mode"
+                )
+        with self._image_condition:
+            message = self._latest_color_image
+        if message is None:
+            raise TimeoutError(f"No RGB image received from {COLOR_TOPIC}")
+        return annotate_charuco(image_to_rgb(message))
+
+    def capture_charuco(
+        self,
+        timeout_s: float = TRANSFORM_TIMEOUT_S,
+    ) -> dict:
+        with self._lock:
+            self._refresh_scanner_status_unlocked()
+            if self._state != "recording":
+                raise RuntimeError(
+                    "ChArUco capture is available only while recording"
+                )
+
+        with self._transform_condition:
+            if self._transformation_mode != "charuco":
+                raise RuntimeError(
+                    "ChArUco capture is unavailable in JSON mode"
+                )
+            if self._transformation_active_unlocked():
+                raise RuntimeError("A transformation capture is already active")
+
+            capture_id = self._next_charuco_capture_id
+            self._next_charuco_capture_id += 1
+            self._charuco_capture_id = capture_id
+            self._charuco_result = None
+            self._charuco_error = None
+            deadline = time.perf_counter() + timeout_s
+            while (
+                self._charuco_capture_id == capture_id
+                and self._charuco_result is None
+                and self._charuco_error is None
+            ):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    self._charuco_capture_id = None
+                    raise TimeoutError(
+                        "Did not receive synchronized RGB, registered depth, "
+                        f"CameraInfo, and point cloud within {timeout_s:.1f} "
+                        "seconds"
+                    )
+                self._transform_condition.wait(timeout=remaining)
+
+            if self._charuco_error is not None:
+                error = self._charuco_error
+                self._charuco_error = None
+                raise error
+            capture = self._charuco_result
+            self._charuco_result = None
+
+        assert capture is not None
+        result = self.status()
+        result.update(
+            success=True,
+            message="Captured one ChArUco-calibrated point cloud",
+            charuco_capture=capture,
+        )
+        return result
 
     def _on_pointcloud(self, message: PointCloud2) -> None:
         with self._transform_condition:
@@ -377,11 +596,181 @@ class RosControlBridge(Node):
                 self._active_transformation = None
                 self._transform_condition.notify_all()
 
+    def _on_synchronized_sensor_frame(
+        self,
+        pointcloud: PointCloud2,
+        color_image: Image,
+        registered_depth: Image,
+        camera_info: CameraInfo,
+    ) -> None:
+        with self._transform_condition:
+            capture_id = self._charuco_capture_id
+        if capture_id is None:
+            return
+
+        try:
+            calibration, depth_m = self._calibrate_sensor_frame(
+                pointcloud,
+                color_image,
+                registered_depth,
+                camera_info,
+            )
+            color_from_pointcloud = self._color_from_pointcloud(
+                pointcloud,
+                color_image,
+            )
+            world_from_pointcloud = (
+                calibration.camera_to_world @ color_from_pointcloud
+            )
+            observation = build_charuco_observation(
+                calibration,
+                depth_m,
+                np.asarray(camera_info.k, dtype=np.float64).reshape(3, 3),
+                np.asarray(camera_info.d, dtype=np.float64),
+                color_from_pointcloud,
+            )
+            transformation = TransformationMatrix(
+                name="charuco",
+                parent_frame_id="world",
+                matrix=tuple(
+                    tuple(float(value) for value in row)
+                    for row in world_from_pointcloud
+                ),
+            )
+            transform_message = transformation_to_message(
+                transformation,
+                pointcloud.header.stamp,
+                pointcloud.header.frame_id,
+            )
+            _attach_charuco_observation(transform_message, observation)
+            capture = observation.as_dict()
+            capture.update(
+                success=True,
+                message="ChArUco pose accepted",
+                matrix=world_from_pointcloud.tolist(),
+            )
+        except (CharucoCalibrationError, ValueError) as error:
+            if isinstance(error, CharucoCalibrationError):
+                capture_error = error
+            else:
+                capture_error = CharucoCalibrationError(str(error))
+            with self._transform_condition:
+                if self._charuco_capture_id != capture_id:
+                    return
+                self._charuco_error = capture_error
+                self._last_charuco = capture_error.as_dict()
+                self._charuco_capture_id = None
+                self._transform_condition.notify_all()
+            return
+
+        with self._transform_condition:
+            if self._charuco_capture_id != capture_id:
+                return
+            self._transform_publisher.publish(transform_message)
+            self._charuco_result = capture
+            self._last_charuco = capture
+            self._charuco_capture_id = None
+            self._transform_condition.notify_all()
+
     @staticmethod
-    def _wait_for_future(future, operation: str):
+    def _calibrate_sensor_frame(
+        pointcloud: PointCloud2,
+        color_image: Image,
+        registered_depth: Image,
+        camera_info: CameraInfo | None,
+    ):
+        if camera_info is None:
+            raise CharucoCalibrationError(
+                f"No camera intrinsics received from {COLOR_CAMERA_INFO_TOPIC}"
+            )
+        pointcloud_frame = pointcloud.header.frame_id
+        if not pointcloud_frame:
+            raise CharucoCalibrationError("Point-cloud frame is empty")
+        color_frame = color_image.header.frame_id
+        if not color_frame:
+            raise CharucoCalibrationError("RGB image frame is empty")
+        if camera_info.header.frame_id != color_frame:
+            raise CharucoCalibrationError(
+                "CameraInfo frame "
+                f"'{camera_info.header.frame_id}' does not match RGB image "
+                f"frame '{color_frame}'"
+            )
+        if (
+            camera_info.width != color_image.width
+            or camera_info.height != color_image.height
+        ):
+            raise CharucoCalibrationError(
+                "CameraInfo dimensions do not match the RGB image"
+            )
+        if not registered_depth.header.frame_id:
+            raise CharucoCalibrationError(
+                "Registered-depth image frame is empty"
+            )
+        if (
+            registered_depth.width != color_image.width
+            or registered_depth.height != color_image.height
+        ):
+            raise CharucoCalibrationError(
+                "Registered-depth dimensions do not match the RGB image"
+            )
+
+        calibration = calibrate_charuco(
+            image_to_rgb(color_image),
+            np.asarray(camera_info.k, dtype=np.float64).reshape(3, 3),
+            np.asarray(camera_info.d, dtype=np.float64),
+        )
+        depth_m = depth_image_to_meters(
+            bytes(registered_depth.data),
+            width=registered_depth.width,
+            height=registered_depth.height,
+            step=registered_depth.step,
+            encoding=registered_depth.encoding,
+            is_bigendian=registered_depth.is_bigendian,
+        )
+        return calibration, depth_m
+
+    def _color_from_pointcloud(
+        self,
+        pointcloud: PointCloud2,
+        color_image: Image,
+    ) -> np.ndarray:
+        pointcloud_frame = pointcloud.header.frame_id
+        color_frame = color_image.header.frame_id
+        if pointcloud_frame == color_frame:
+            return np.eye(4, dtype=np.float64)
+
+        try:
+            color_from_pointcloud_message = self._tf_buffer.lookup_transform(
+                color_frame,
+                pointcloud_frame,
+                Time.from_msg(pointcloud.header.stamp),
+                timeout=Duration(seconds=TF_TIMEOUT_S),
+            )
+        except TransformException as error:
+            raise CharucoCalibrationError(
+                "Cannot transform point-cloud frame "
+                f"'{pointcloud_frame}' into RGB frame '{color_frame}': {error}"
+            ) from error
+
+        try:
+            color_from_pointcloud = transform_to_matrix(
+                color_from_pointcloud_message
+            )
+        except ValueError as error:
+            raise CharucoCalibrationError(
+                f"Invalid RealSense depth-to-color transform: {error}"
+            ) from error
+        return color_from_pointcloud
+
+    @staticmethod
+    def _wait_for_future(
+        future,
+        operation: str,
+        timeout_s: float = SERVICE_TIMEOUT_S,
+    ):
         completed = threading.Event()
         future.add_done_callback(lambda _future: completed.set())
-        deadline = time.perf_counter() + SERVICE_TIMEOUT_S
+        deadline = time.perf_counter() + timeout_s
         while not completed.is_set():
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
@@ -398,6 +787,7 @@ class RosControlBridge(Node):
             "database_path": self._database_path,
             "session_name": self._session_name,
             "target_rgb": list(self._target_rgb),
+            "transformation_mode": self._transformation_mode,
         }
         with self._transform_condition:
             result.update(
@@ -406,11 +796,16 @@ class RosControlBridge(Node):
                 ),
                 transformation_index=self._transformation_index + 1,
                 transformation_total=len(self._transformations),
-                transform_burst_active=bool(
-                    self._remaining_transform_messages
-                ),
+                transform_burst_active=self._transformation_active_unlocked(),
+                last_charuco=self._last_charuco,
             )
         return result
+
+    def _transformation_active_unlocked(self) -> bool:
+        return bool(
+            self._remaining_transform_messages
+            or self._charuco_capture_id is not None
+        )
 
     def _current_transformation_unlocked(self):
         return self._transformations[self._transformation_index]
@@ -493,6 +888,18 @@ def create_app(
                 )
             database_path = session_database_path(session_name)
             frames = list_frames(database_path)
+            stages = ["raw"]
+            aligned_path = aligned_database_path(database_path)
+            if aligned_path.is_file():
+                aligned_frames = {
+                    frame["id"]: frame for frame in list_frames(aligned_path)
+                }
+                if set(aligned_frames) == {frame["id"] for frame in frames}:
+                    for frame in frames:
+                        frame["optimized_matrix"] = aligned_frames[
+                            frame["id"]
+                        ]["matrix"]
+                    stages.extend(("filtered", "aligned"))
         except ValueError as error:
             return jsonify(success=False, message=str(error)), 400
         except FileNotFoundError as error:
@@ -506,6 +913,7 @@ def create_app(
             frames=frames,
             total_frames=len(frames),
             total_points=sum(frame["point_count"] for frame in frames),
+            stages=stages,
         )
 
     @app.get("/api/sessions/<session_name>/frames/<int:frame_id>")
@@ -521,6 +929,11 @@ def create_app(
                     409,
                 )
             database_path = session_database_path(session_name)
+            stage = request.args.get("stage", "raw")
+            if stage not in REPLAY_STAGES:
+                raise ValueError(
+                    f"stage must be one of {', '.join(sorted(REPLAY_STAGES))}"
+                )
             max_points_value = request.args.get("max_points")
             max_points = (
                 MAX_DISPLAY_POINTS
@@ -531,10 +944,17 @@ def create_app(
                 raise ValueError(
                     f"max_points must be from 1 to {MAX_DISPLAY_POINTS}"
                 )
-            payload = build_frame_payload(
+            aligned_path = aligned_database_path(database_path)
+            if stage != "raw" and not aligned_path.is_file():
+                raise FileNotFoundError(
+                    f"Aligned recording not found for session '{session_name}'"
+                )
+            payload = build_replay_frame_payload(
                 database_path,
+                aligned_path,
                 frame_id,
                 max_points,
+                stage,
             )
         except ValueError as error:
             return jsonify(success=False, message=str(error)), 400
@@ -595,6 +1015,22 @@ def create_app(
             return jsonify(success=False, message=str(error)), 409
         return jsonify(result)
 
+    @app.post("/api/transformation/mode")
+    def transformation_mode():
+        body = request.get_json(silent=True)
+        try:
+            mode = validated_transformation_mode(
+                body.get("mode") if body else None
+            )
+            result = bridge.set_transformation_mode(mode)
+        except ValueError as error:
+            return jsonify(success=False, message=str(error)), 400
+        except TimeoutError as error:
+            return jsonify(success=False, message=str(error)), 503
+        except RuntimeError as error:
+            return jsonify(success=False, message=str(error)), 502
+        return jsonify(result), 200 if result["success"] else 409
+
     @app.post("/api/transformation/step")
     def step_transformation():
         body = request.get_json(silent=True)
@@ -606,6 +1042,36 @@ def create_app(
         except RuntimeError as error:
             return jsonify(success=False, message=str(error)), 409
         return jsonify(result)
+
+    @app.post("/api/charuco/capture")
+    def capture_charuco():
+        try:
+            result = bridge.capture_charuco()
+        except CharucoCalibrationError as error:
+            return jsonify(error.as_dict()), 422
+        except TimeoutError as error:
+            return jsonify(success=False, message=str(error)), 504
+        except RuntimeError as error:
+            return jsonify(success=False, message=str(error)), 409
+        return jsonify(result)
+
+    @app.get("/api/charuco/preview")
+    def charuco_preview():
+        try:
+            preview = bridge.build_charuco_preview()
+            payload = build_rgb_payload(preview)
+        except TimeoutError as error:
+            return jsonify(success=False, message=str(error)), 503
+        except RuntimeError as error:
+            return jsonify(success=False, message=str(error)), 409
+        except (CharucoCalibrationError, ValueError) as error:
+            return jsonify(success=False, message=str(error)), 500
+
+        response = Response(payload, mimetype="application/octet-stream")
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Image-Width"] = str(preview.shape[1])
+        response.headers["X-Image-Height"] = str(preview.shape[0])
+        return response
 
     @app.post("/api/recording/<command>")
     def recording_command(command):
@@ -670,13 +1136,40 @@ def create_app(
             )
 
         try:
-            payload = build_point_payload(
+            revision = source_revision(database_path)
+            result = read_fused_cloud(
+                aligned_database_path(database_path),
+                revision,
+            )
+            stride = max(
+                1,
+                (len(result.xyz) + MAX_DISPLAY_POINTS - 1)
+                // MAX_DISPLAY_POINTS,
+            )
+            payload = build_array_payload(
+                result.xyz[::stride],
+                result.rgb[::stride],
+                len(result.xyz),
+            )
+        except AlignedRecordingError as error:
+            app.logger.error(
+                "Cannot load aligned point cloud for '%s': %s",
                 database_path,
-                MAX_DISPLAY_POINTS,
+                error,
+            )
+            return (
+                jsonify(
+                    success=False,
+                    message=f"Cannot load aligned points: {error}",
+                ),
+                422,
             )
         except (sqlite3.Error, ValueError) as error:
             return (
-                jsonify(success=False, message=f"Cannot read points: {error}"),
+                jsonify(
+                    success=False,
+                    message=f"Cannot process points: {error}",
+                ),
                 500,
             )
 
@@ -685,6 +1178,20 @@ def create_app(
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Displayed-Points"] = str(displayed_points)
         response.headers["X-Total-Points"] = str(total_points)
+        response.headers["X-Raw-Points"] = str(result.raw_points)
+        response.headers["X-Cleaned-Points"] = str(result.cleaned_points)
+        response.headers["X-Accepted-Edges"] = str(result.accepted_edges)
+        response.headers["X-Rejected-Edges"] = str(result.rejected_edges)
+        response.headers["X-Charuco-Frames"] = str(
+            result.charuco_frame_count
+        )
+        if result.charuco_reprojection_max_px is not None:
+            response.headers["X-Charuco-Max-Reprojection-Px"] = str(
+                result.charuco_reprojection_max_px
+            )
+            response.headers["X-Cloud-3mm-Fraction"] = str(
+                result.cloud_overlap_fraction_3mm
+            )
         return response
 
     return app

@@ -379,8 +379,33 @@ h2 {
   margin-bottom: 10px;
 }
 
-#publish-transformation-button {
+#publish-transformation-button,
+#charuco-capture-button {
   width: 100%;
+}
+
+.transformation-mode-field,
+.charuco-metrics {
+  margin-bottom: 10px;
+}
+
+.charuco-preview-shell {
+  overflow: hidden;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--surface-deep);
+}
+
+#charuco-preview {
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  background: var(--surface-deep);
+}
+
+#charuco-preview-status {
+  margin: 7px 10px 9px;
 }
 
 .color-value {
@@ -548,15 +573,58 @@ h2 {
     );
 }
 
+.orientation-gizmo {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 3;
+  width: 104px;
+  height: 104px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-translucent);
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+}
+
+.orientation-gizmo canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.point-coordinate-tooltip {
+  position: absolute;
+  z-index: 4;
+  padding: 7px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-translucent);
+  box-shadow: 0 8px 24px var(--panel-shadow);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
+}
+
+.point-coordinate-tooltip[hidden] {
+  display: none;
+}
+
 .replay-dock {
   position: absolute;
   bottom: 24px;
   left: 50%;
   z-index: 3;
   display: flex;
-  width: min(680px, calc(100% - 32px));
+  width: min(980px, calc(100% - 32px));
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 18px;
   border: 1px solid var(--instruction-border);
   border-radius: 12px;
@@ -592,6 +660,24 @@ h2 {
   color: var(--text-muted);
   font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
+}
+
+.replay-stage-controls {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 6px;
+}
+
+.replay-stage-controls button {
+  min-height: 36px;
+  padding: 0 11px;
+  font-size: 0.7rem;
+}
+
+.replay-stage-controls button[aria-pressed="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: #ffffff;
 }
 
 .camera-overlay-toggle {
@@ -869,6 +955,10 @@ h2 {
   }
 
   .replay-dock-controls {
+    grid-template-columns: repeat(3, 1fr);
+  }
+
+  .replay-stage-controls {
     grid-template-columns: repeat(3, 1fr);
   }
 

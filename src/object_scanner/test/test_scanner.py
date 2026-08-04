@@ -5,8 +5,12 @@ import sqlite3
 import struct
 
 import numpy as np
+import object_scanner.scanner_node as scanner_node
 from object_scanner.scanner_node import ObjectScannerNode, RecordingState
 from object_scanner_interfaces.msg import NamedTransform
+from object_scanner_processing.pointcloud_processing import (
+    PointCloudProcessingError,
+)
 import rclpy
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import Image, PointCloud2, PointField
@@ -51,7 +55,61 @@ def make_transform(stamp, child_frame_id, matrix, name="identity"):
     return message
 
 
-def test_recording_services_append_to_one_sqlite_session(tmp_path):
+def add_charuco_observation(message, corner_count=20):
+    observation = message.charuco_observation
+    observation.corner_ids = list(range(corner_count))
+    observation.image_points = np.zeros((corner_count, 2)).reshape(-1).tolist()
+    observation.depth_valid = [True] * corner_count
+    observation.child_points = (
+        np.column_stack(
+            (
+                np.arange(corner_count) * 0.001,
+                np.zeros(corner_count),
+                np.full(corner_count, 0.4),
+            )
+        )
+        .reshape(-1)
+        .tolist()
+    )
+    observation.depth_valid_pixel_counts = [25] * corner_count
+    observation.depth_inlier_pixel_counts = [25] * corner_count
+    observation.depth_mad_m = [0.0] * corner_count
+    observation.depth_invalid_reasons = [""] * corner_count
+    observation.camera_matrix = [
+        500.0,
+        0.0,
+        320.0,
+        0.0,
+        500.0,
+        240.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    observation.distortion = [0.0] * 5
+    observation.color_from_child = np.eye(4).reshape(-1).tolist()
+    observation.initial_reprojection_errors_px = [0.2] * corner_count
+    observation.initial_reprojection_rmse_px = 0.2
+
+
+def stub_aligned_generation(monkeypatch):
+    calls = []
+
+    def generate(database_path):
+        calls.append(database_path)
+        aligned_path = database_path.parent / "aligned_recording.sqlite3"
+        aligned_path.write_bytes(b"aligned")
+        return aligned_path
+
+    monkeypatch.setattr(scanner_node, "generate_aligned_recording", generate)
+    return calls
+
+
+def test_recording_services_append_to_one_sqlite_session(
+    tmp_path,
+    monkeypatch,
+):
+    alignment_calls = stub_aligned_generation(monkeypatch)
     rclpy.init(
         args=[
             "--ros-args",
@@ -100,6 +158,8 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
         response = call(node, node._on_pause_recording)
         assert response.success
         assert node._state is RecordingState.PAUSED
+        assert alignment_calls == [database_path]
+        assert (database_path.parent / "aligned_recording.sqlite3").is_file()
         with closing(sqlite3.connect(database_path)) as connection:
             row = connection.execute(
                 """
@@ -126,6 +186,7 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
         assert response.success
         assert response.message == str(database_path)
         assert node._state is RecordingState.STOPPED
+        assert alignment_calls == [database_path, database_path]
         assert json.loads(
             call(node, node._on_recording_status).message
         )["state"] == "stopped"
@@ -173,7 +234,92 @@ def test_recording_services_append_to_one_sqlite_session(tmp_path):
         rclpy.shutdown()
 
 
-def test_reference_color_changes_only_while_stopped(tmp_path):
+def test_alignment_failure_reports_error_but_keeps_recorder_state(
+    tmp_path,
+    monkeypatch,
+):
+    def reject_alignment(_database_path):
+        raise PointCloudProcessingError("registration graph is weak")
+
+    monkeypatch.setattr(
+        scanner_node,
+        "generate_aligned_recording",
+        reject_alignment,
+    )
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p",
+            f"output_directory:={tmp_path}",
+            "-p",
+            "session_name:=weak_scan",
+        ]
+    )
+    node = ObjectScannerNode()
+    try:
+        assert call(node, node._on_start_recording).success
+
+        response = call(node, node._on_pause_recording)
+        assert not response.success
+        assert "aligned output failed" in response.message
+        assert node._state is RecordingState.PAUSED
+
+        response = call(node, node._on_stop_recording)
+        assert not response.success
+        assert "aligned output failed" in response.message
+        assert node._state is RecordingState.STOPPED
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_records_charuco_observation_from_transform(tmp_path, monkeypatch):
+    stub_aligned_generation(monkeypatch)
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p",
+            f"output_directory:={tmp_path}",
+            "-p",
+            "session_name:=charuco_scan",
+        ]
+    )
+    node = ObjectScannerNode()
+    try:
+        assert call(node, node._on_start_recording).success
+        stamp = PointCloud2().header.stamp
+        stamp.sec = 1
+        cloud = make_cloud(
+            [(0.0, 0.0, 0.4, (0, 255, 0))],
+            stamp,
+        )
+        image = Image()
+        image.header.stamp = stamp
+        transform = make_transform(
+            stamp,
+            cloud.header.frame_id,
+            np.eye(4),
+            name="charuco",
+        )
+        add_charuco_observation(transform)
+
+        node._on_synchronized_frame(cloud, image, transform)
+        assert call(node, node._on_pause_recording).success
+
+        with closing(sqlite3.connect(node._database_path)) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM charuco_corners"
+            ).fetchone()[0] == 20
+        assert call(node, node._on_stop_recording).success
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_reference_color_changes_only_while_stopped(tmp_path, monkeypatch):
+    stub_aligned_generation(monkeypatch)
     rclpy.init(
         args=[
             "--ros-args",

@@ -10,15 +10,7 @@
 8. If asked to explain a function's inputs and outputs, include the input output data format and provide a concrete example of the input output data.
 9. Add short comments in understandable English on parts that are not obvious or hard to follow. Use section dividers (e.g. `// ── Section name ──`) to separate logical groups. Do not over-comment obvious code.
 10. Do not remove or rephrase existing comments unless explicitly asked. Preserve the user's original comments as-is.
-11. If you need information about `src/realsense-ros`, check `memory.md` first.
-
-
-## Tracker Launching
-
-- Use `.\run_tracker.ps1` for tracker runs. It is the only supported tracker entry point, and it auto-selects the best available environment while preferring `.venv_ros2` when CUDA/TensorRT is available.
-- Use `.\run_tracker.ps1 -PreferredEnv ros2` to force the GPU/TensorRT environment.
-- Use `.\run_tracker.ps1 -PreferredEnv clean` only when you explicitly want the CPU-only fallback.
-- For quick checks without starting the tracker, run `.\run_tracker.ps1 -ProbeOnly` to see which environment would be selected.
+11. For numerical and mathematical operations, prefer batched matrix/tensor operations over sequential scalar or per-item calculations. Prefer PyTorch when it is already available and suitable; use loops only for non-vectorizable control flow or bookkeeping.
 
 ## ROS Validation
 

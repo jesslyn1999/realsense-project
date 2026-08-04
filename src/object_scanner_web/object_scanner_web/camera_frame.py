@@ -39,6 +39,20 @@ def image_to_rgb(message: Image) -> np.ndarray:
 
 def build_camera_payload(message: Image) -> bytes:
     """Encode width, height, and exact RGB bytes for the browser."""
-    image = image_to_rgb(message)
-    header = CAMERA_HEADER.pack(CAMERA_MAGIC, message.width, message.height)
-    return header + image.tobytes()
+    return build_rgb_payload(image_to_rgb(message))
+
+
+def build_rgb_payload(image: np.ndarray) -> bytes:
+    """Encode one row-packed RGB8 array for the browser."""
+    pixels = np.asarray(image)
+    if (
+        pixels.ndim != 3
+        or pixels.shape[2] != 3
+        or pixels.dtype != np.uint8
+    ):
+        raise ValueError("image must be an RGB uint8 array with shape (H, W, 3)")
+    height, width = pixels.shape[:2]
+    if width < 1 or height < 1:
+        raise ValueError("Camera image dimensions must be positive")
+    header = CAMERA_HEADER.pack(CAMERA_MAGIC, width, height)
+    return header + np.ascontiguousarray(pixels).tobytes()

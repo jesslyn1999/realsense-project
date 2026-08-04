@@ -1,6 +1,7 @@
 import numpy as np
 from object_scanner_web_orbbec.sqlite_recording import SqliteRecording
 from object_scanner_web_orbbec.sqlite_reader import (
+    build_array_payload,
     build_frame_payload,
     build_point_payload,
     list_frames,
@@ -90,6 +91,12 @@ def test_reader_samples_committed_open_database_and_encodes_payload(tmp_path):
             PAYLOAD_MAGIC,
             3,
             6,
+        )
+        array_payload = build_array_payload(xyz, rgb, total_points=12)
+        assert PAYLOAD_HEADER.unpack_from(array_payload) == (
+            PAYLOAD_MAGIC,
+            4,
+            12,
         )
     finally:
         recording.close()

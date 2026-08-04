@@ -74,6 +74,8 @@ def generate_launch_description():
         DeclareLaunchArgument('align_mode', default_value='HW'),
         DeclareLaunchArgument('laser_energy_level', default_value='-1'),
         DeclareLaunchArgument('enable_heartbeat', default_value='false'),
+        DeclareLaunchArgument('enable_frame_sync', default_value='false'),
+        DeclareLaunchArgument('frame_aggregate_mode', default_value='ANY'),
         DeclareLaunchArgument('enable_frame_timestamp_csv', default_value='false'),
         DeclareLaunchArgument('frame_timestamp_csv_file', default_value=''),
     ]

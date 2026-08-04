@@ -18,6 +18,16 @@ from object_scanner.sqlite_recording import (
     validated_session_name,
 )
 from object_scanner_interfaces.msg import NamedTransform
+from object_scanner_processing.aligned_recording import (
+    AlignedRecordingError,
+    generate_aligned_recording,
+)
+from object_scanner_processing.charuco_observations import (
+    observation_from_message,
+)
+from object_scanner_processing.pointcloud_processing import (
+    PointCloudProcessingError,
+)
 from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.node import Node
@@ -212,6 +222,9 @@ class ObjectScannerNode(Node):
 
         try:
             matrix = np.asarray(transform.matrix, dtype=np.float64).reshape(4, 4)
+            charuco_observation = observation_from_message(
+                transform.charuco_observation
+            )
             xyz, rgb = filter_colored_points(
                 pointcloud,
                 self._target_rgb,
@@ -237,6 +250,7 @@ class ObjectScannerNode(Node):
                 transformation_matrix=matrix,
                 xyz=world_xyz,
                 rgb=world_rgb,
+                charuco_observation=charuco_observation,
             )
         except (sqlite3.Error, ValueError) as error:
             self._state = RecordingState.PAUSED
@@ -321,6 +335,19 @@ class ObjectScannerNode(Node):
 
         self._state = RecordingState.PAUSED
         self.get_logger().info("Recording paused")
+        assert self._database_path is not None
+        try:
+            self._generate_aligned_recording(self._database_path)
+        except (
+            AlignedRecordingError,
+            OSError,
+            PointCloudProcessingError,
+            sqlite3.Error,
+            ValueError,
+        ) as error:
+            message = f"Recording paused, but aligned output failed: {error}"
+            self.get_logger().error(message)
+            return self._set_response(response, False, message)
         return self._set_response(
             response,
             True,
@@ -366,11 +393,28 @@ class ObjectScannerNode(Node):
             )
 
         self.get_logger().info(f"Stopped recording {database_path}")
+        assert database_path is not None
+        try:
+            self._generate_aligned_recording(database_path)
+        except (
+            AlignedRecordingError,
+            OSError,
+            PointCloudProcessingError,
+            sqlite3.Error,
+            ValueError,
+        ) as error:
+            message = f"Recording stopped, but aligned output failed: {error}"
+            self.get_logger().error(message)
+            return self._set_response(response, False, message)
         return self._set_response(
             response,
             True,
             str(database_path),
         )
+
+    def _generate_aligned_recording(self, database_path: Path) -> None:
+        aligned_path = generate_aligned_recording(database_path)
+        self.get_logger().info(f"Saved aligned point clouds to {aligned_path}")
 
     @staticmethod
     def _set_response(

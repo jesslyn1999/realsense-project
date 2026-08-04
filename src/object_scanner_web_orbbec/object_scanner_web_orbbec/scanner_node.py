@@ -11,6 +11,17 @@ import time
 
 import message_filters
 import numpy as np
+from object_scanner_interfaces.msg import NamedTransform
+from object_scanner_processing.aligned_recording import (
+    AlignedRecordingError,
+    generate_aligned_recording,
+)
+from object_scanner_processing.charuco_observations import (
+    observation_from_message,
+)
+from object_scanner_processing.pointcloud_processing import (
+    PointCloudProcessingError,
+)
 from object_scanner_web_orbbec.pointcloud import (
     filter_colored_points,
     transform_filtered_cloud,
@@ -19,12 +30,11 @@ from object_scanner_web_orbbec.sqlite_recording import (
     SqliteRecording,
     validated_session_name,
 )
-from object_scanner_interfaces.msg import NamedTransform
 from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2
 from std_srvs.srv import Trigger
 
@@ -32,7 +42,7 @@ POINTCLOUD_TOPIC = "/camera/depth_registered/points"
 COLOR_TOPIC = "/camera/color/image_raw"
 TRANSFORM_TOPIC = "/object_scanner_orbbec/camera_to_world"
 SYNC_QUEUE_SIZE = 30
-SYNC_SLOP_S = 0.1
+SYNC_SLOP_S = 0.05
 DIAGNOSTIC_SESSION_NAME = "do_check"
 TRANSFORM_QOS = QoSProfile(
     depth=10,
@@ -368,6 +378,9 @@ class OrbbecObjectScannerNode(Node):
 
         try:
             matrix = np.asarray(transform.matrix, dtype=np.float64).reshape(4, 4)
+            charuco_observation = observation_from_message(
+                transform.charuco_observation
+            )
             xyz, rgb = filter_colored_points(
                 pointcloud,
                 self._target_rgb,
@@ -393,6 +406,7 @@ class OrbbecObjectScannerNode(Node):
                 transformation_matrix=matrix,
                 xyz=world_xyz,
                 rgb=world_rgb,
+                charuco_observation=charuco_observation,
             )
             transform_stamp = self._stamp(transform)
             attempt_id = self._attempt_ids_by_transform.pop(
@@ -501,6 +515,19 @@ class OrbbecObjectScannerNode(Node):
         self._state = RecordingState.PAUSED
         self._reset_publish_attempt_tracking()
         self.get_logger().info("Recording paused")
+        assert self._database_path is not None
+        try:
+            self._generate_aligned_recording(self._database_path)
+        except (
+            AlignedRecordingError,
+            OSError,
+            PointCloudProcessingError,
+            sqlite3.Error,
+            ValueError,
+        ) as error:
+            message = f"Recording paused, but aligned output failed: {error}"
+            self.get_logger().error(message)
+            return self._set_response(response, False, message)
         return self._set_response(
             response,
             True,
@@ -547,11 +574,28 @@ class OrbbecObjectScannerNode(Node):
             )
 
         self.get_logger().info(f"Stopped recording {database_path}")
+        assert database_path is not None
+        try:
+            self._generate_aligned_recording(database_path)
+        except (
+            AlignedRecordingError,
+            OSError,
+            PointCloudProcessingError,
+            sqlite3.Error,
+            ValueError,
+        ) as error:
+            message = f"Recording stopped, but aligned output failed: {error}"
+            self.get_logger().error(message)
+            return self._set_response(response, False, message)
         return self._set_response(
             response,
             True,
             str(database_path),
         )
+
+    def _generate_aligned_recording(self, database_path: Path) -> None:
+        aligned_path = generate_aligned_recording(database_path)
+        self.get_logger().info(f"Saved aligned point clouds to {aligned_path}")
 
     @staticmethod
     def _set_response(

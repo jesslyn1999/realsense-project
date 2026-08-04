@@ -24,6 +24,25 @@ const transformationParentFrame = document.querySelector(
   "#transformation-parent-frame",
 );
 const transformationMatrix = document.querySelector("#transformation-matrix");
+const transformationModeSelect = document.querySelector(
+  "#transformation-mode",
+);
+const jsonTransformationPanel = document.querySelector(
+  "#json-transformation-panel",
+);
+const charucoTransformationPanel = document.querySelector(
+  "#charuco-transformation-panel",
+);
+const charucoPreview = document.querySelector("#charuco-preview");
+const charucoPreviewStatus = document.querySelector(
+  "#charuco-preview-status",
+);
+const charucoCornerCount = document.querySelector("#charuco-corner-count");
+const charucoRmse = document.querySelector("#charuco-rmse");
+const charucoMatrix = document.querySelector("#charuco-matrix");
+const charucoCaptureButton = document.querySelector(
+  "#charuco-capture-button",
+);
 const publishTransformationButton = document.querySelector(
   "#publish-transformation-button",
 );
@@ -72,6 +91,7 @@ const THEME_STORAGE_KEY = "object-scanner-theme";
 const MAX_REPLAY_POINTS = 250_000;
 const POINT_PICK_THRESHOLD_M = 0.008;
 const POINT_TOOLTIP_OFFSET_PX = 12;
+const CHARUCO_PREVIEW_INTERVAL_MS = 200;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1000);
@@ -158,6 +178,7 @@ scene.add(axesHelper);
 let currentState = "stopped";
 let currentDatabasePath = null;
 let transformBurstActive = false;
+let transformationMode = "json";
 let pointCloud = null;
 let cameraRgb = null;
 let cameraWidth = 0;
@@ -173,11 +194,14 @@ let replayDisplayedPoints = 0;
 let replayTotalPoints = 0;
 let replayCameraOverlay = null;
 let pendingPointHover = null;
+let charucoPreviewGeneration = 0;
+let charucoPreviewRunning = false;
 
 const sourceCanvas = document.createElement("canvas");
 const sourceContext = sourceCanvas.getContext("2d");
 const previewContext = cameraPreview.getContext("2d");
 const loupeContext = pixelLoupe.getContext("2d");
+const charucoPreviewContext = charucoPreview.getContext("2d");
 
 function resetView() {
   camera.position.set(1.2, 1.0, 1.2);
@@ -244,9 +268,35 @@ function showTransformation(transformation) {
   transformationName.textContent = transformation.name;
   transformationParentFrame.textContent =
     `Parent frame: ${transformation.parent_frame_id}`;
-  transformationMatrix.textContent = transformation.matrix
+  transformationMatrix.textContent = formatMatrix(transformation.matrix);
+}
+
+function formatMatrix(matrix) {
+  return matrix
     .map((row) => `[${row.join(", ")}]`)
     .join("\n");
+}
+
+function showCharucoResult(result) {
+  if (!result) {
+    return;
+  }
+  charucoCornerCount.textContent = Number.isInteger(result.corner_count)
+    ? result.corner_count.toString()
+    : "—";
+  charucoRmse.textContent = Number.isFinite(result.reprojection_rmse_px)
+    ? `${result.reprojection_rmse_px.toFixed(3)} px`
+    : "—";
+  if (Array.isArray(result.matrix)) {
+    charucoMatrix.textContent = formatMatrix(result.matrix);
+  }
+}
+
+function showTransformationMode() {
+  transformationModeSelect.value = transformationMode;
+  jsonTransformationPanel.hidden = transformationMode !== "json";
+  charucoTransformationPanel.hidden = transformationMode !== "charuco";
+  updateCharucoPreviewLoop();
 }
 
 function isSessionNameValid() {
@@ -266,9 +316,18 @@ function updateControls(busy = false) {
   applyColorButton.disabled = colorDisabled;
   cameraColorButton.disabled = colorDisabled;
   sessionNameInput.disabled = busy || currentState !== "stopped";
-  publishTransformationButton.disabled = busy || transformBurstActive;
-  previousTransformationButton.disabled = busy || transformBurstActive;
-  nextTransformationButton.disabled = busy || transformBurstActive;
+  transformationModeSelect.disabled =
+    busy || currentState !== "stopped" || transformBurstActive;
+  const jsonDisabled =
+    busy || transformationMode !== "json" || transformBurstActive;
+  publishTransformationButton.disabled = jsonDisabled;
+  previousTransformationButton.disabled = jsonDisabled;
+  nextTransformationButton.disabled = jsonDisabled;
+  charucoCaptureButton.disabled =
+    busy ||
+    transformationMode !== "charuco" ||
+    currentState !== "recording" ||
+    transformBurstActive;
   savedSessionSelect.disabled =
     busy ||
     currentState !== "stopped" ||
@@ -287,6 +346,10 @@ function applyStatus(status) {
   stateBadge.className = `state-badge ${currentState}`;
   databasePath.textContent = currentDatabasePath || "No recording selected";
   transformBurstActive = Boolean(status.transform_burst_active);
+  if (["json", "charuco"].includes(status.transformation_mode)) {
+    transformationMode = status.transformation_mode;
+    showTransformationMode();
+  }
   if (currentState !== "stopped" && replayMode) {
     exitReplay(false);
   }
@@ -302,6 +365,9 @@ function applyStatus(status) {
   }
   if (status.transformation) {
     showTransformation(status.transformation);
+  }
+  if (status.last_charuco) {
+    showCharucoResult(status.last_charuco);
   }
   if (
     Number.isInteger(status.transformation_index) &&
@@ -570,14 +636,32 @@ function renderPayload(buffer) {
 }
 
 async function loadPoints() {
-  setMessage("Loading recorded points…");
+  setMessage("Loading saved aligned point clouds…");
   const response = await fetch("/api/points", { cache: "no-store" });
   if (!response.ok) {
     const error = await response.json();
-    throw new Error(error.message || "Cannot load recorded points");
+    throw new Error(error.message || "Cannot load aligned points");
   }
   renderPayload(await response.arrayBuffer());
-  setMessage("Showing all committed points recorded so far.");
+  const acceptedEdges = response.headers.get("X-Accepted-Edges");
+  const rejectedEdges = response.headers.get("X-Rejected-Edges");
+  const charucoFrames = Number(response.headers.get("X-Charuco-Frames"));
+  const charucoMax = Number(
+    response.headers.get("X-Charuco-Max-Reprojection-Px"),
+  );
+  const cloudFraction = Number(
+    response.headers.get("X-Cloud-3mm-Fraction"),
+  );
+  const charucoMetrics =
+    charucoFrames > 0 && Number.isFinite(charucoMax) &&
+    Number.isFinite(cloudFraction)
+      ? ` ChArUco max ${charucoMax.toFixed(3)} px; ` +
+        `${(cloudFraction * 100).toFixed(3)}% within 3 mm.`
+      : "";
+  setMessage(
+    `Showing cleaned, registered preview (${acceptedEdges} edges accepted, ` +
+      `${rejectedEdges} rejected).${charucoMetrics}`,
+  );
 }
 
 function resetReplay(clearSelection = true) {
@@ -834,6 +918,55 @@ async function publishTransformation() {
   }
 }
 
+async function setTransformationMode() {
+  const selectedMode = transformationModeSelect.value;
+  updateControls(true);
+  setMessage(`Switching to ${selectedMode} transformation mode…`);
+  try {
+    const response = await fetch("/api/transformation/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: selectedMode }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.message || "Cannot change transformation mode");
+    }
+    applyStatus(result);
+    setMessage(result.message);
+  } catch (error) {
+    transformationModeSelect.value = transformationMode;
+    setMessage(error.message, true);
+  } finally {
+    updateControls();
+  }
+}
+
+async function captureCharuco() {
+  updateControls(true);
+  setMessage("Detecting ChArUco board for the next point cloud…");
+  try {
+    const response = await fetch("/api/charuco/capture", {
+      method: "POST",
+    });
+    const result = await response.json();
+    showCharucoResult(result.charuco_capture || result);
+    if (!response.ok) {
+      throw new Error(result.message || "Cannot capture with ChArUco");
+    }
+    applyStatus(result);
+    setMessage(
+      `${result.message}: ${result.charuco_capture.corner_count} corners, ` +
+        `${result.charuco_capture.valid_depth_corner_count} valid depth, ` +
+        `${result.charuco_capture.reprojection_rmse_px.toFixed(3)} px RMSE.`,
+    );
+  } catch (error) {
+    setMessage(error.message, true);
+  } finally {
+    updateControls();
+  }
+}
+
 async function stepTransformation(delta) {
   updateControls(true);
   try {
@@ -991,7 +1124,7 @@ function averageCameraColor(x, y) {
   return sum.map((channel) => Math.round(channel / count));
 }
 
-function decodeCameraFrame(buffer) {
+function decodeRgbPayload(buffer) {
   if (buffer.byteLength < 12) {
     throw new Error("Camera frame is incomplete");
   }
@@ -1000,35 +1133,44 @@ function decodeCameraFrame(buffer) {
     throw new Error("Camera frame has an unsupported format");
   }
   const header = new DataView(buffer);
-  cameraWidth = header.getUint32(4, true);
-  cameraHeight = header.getUint32(8, true);
-  const expectedBytes = 12 + cameraWidth * cameraHeight * 3;
+  const width = header.getUint32(4, true);
+  const height = header.getUint32(8, true);
+  const expectedBytes = 12 + width * height * 3;
   if (buffer.byteLength !== expectedBytes) {
     throw new Error("Camera frame size does not match its header");
   }
 
-  cameraRgb = new Uint8Array(buffer, 12);
-  const rgba = new Uint8ClampedArray(cameraWidth * cameraHeight * 4);
+  const rgb = new Uint8Array(buffer, 12);
+  const rgba = new Uint8ClampedArray(width * height * 4);
   for (
     let sourceOffset = 0, destinationOffset = 0;
-    sourceOffset < cameraRgb.length;
+    sourceOffset < rgb.length;
     sourceOffset += 3, destinationOffset += 4
   ) {
-    rgba[destinationOffset] = cameraRgb[sourceOffset];
-    rgba[destinationOffset + 1] = cameraRgb[sourceOffset + 1];
-    rgba[destinationOffset + 2] = cameraRgb[sourceOffset + 2];
+    rgba[destinationOffset] = rgb[sourceOffset];
+    rgba[destinationOffset + 1] = rgb[sourceOffset + 1];
+    rgba[destinationOffset + 2] = rgb[sourceOffset + 2];
     rgba[destinationOffset + 3] = 255;
   }
+  return {
+    width,
+    height,
+    rgb,
+    imageData: new ImageData(rgba, width, height),
+  };
+}
+
+function decodeCameraFrame(buffer) {
+  const frame = decodeRgbPayload(buffer);
+  cameraWidth = frame.width;
+  cameraHeight = frame.height;
+  cameraRgb = frame.rgb;
 
   sourceCanvas.width = cameraWidth;
   sourceCanvas.height = cameraHeight;
   cameraPreview.width = cameraWidth;
   cameraPreview.height = cameraHeight;
-  sourceContext.putImageData(
-    new ImageData(rgba, cameraWidth, cameraHeight),
-    0,
-    0,
-  );
+  sourceContext.putImageData(frame.imageData, 0, 0);
   selectedPixel = null;
   selectedCameraRgb = null;
   useCameraColorButton.disabled = true;
@@ -1038,6 +1180,64 @@ function decodeCameraFrame(buffer) {
     "Move over the image to magnify pixels, then click one.";
   drawPreview();
   drawLoupe(Math.floor(cameraWidth / 2), Math.floor(cameraHeight / 2));
+}
+
+async function runCharucoPreview(generation) {
+  while (
+    charucoPreviewRunning &&
+    charucoPreviewGeneration === generation
+  ) {
+    const started = performance.now();
+    try {
+      const response = await fetch("/api/charuco/preview", {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || "Cannot load ChArUco preview");
+      }
+      const frame = decodeRgbPayload(await response.arrayBuffer());
+      if (
+        !charucoPreviewRunning ||
+        charucoPreviewGeneration !== generation
+      ) {
+        return;
+      }
+      charucoPreview.width = frame.width;
+      charucoPreview.height = frame.height;
+      charucoPreviewContext.putImageData(frame.imageData, 0, 0);
+      charucoPreviewStatus.textContent = "Live detection · up to 5 FPS";
+    } catch (error) {
+      if (
+        !charucoPreviewRunning ||
+        charucoPreviewGeneration !== generation
+      ) {
+        return;
+      }
+      charucoPreviewStatus.textContent = error.message;
+    }
+
+    const remaining =
+      CHARUCO_PREVIEW_INTERVAL_MS - (performance.now() - started);
+    if (remaining > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, remaining));
+    }
+  }
+}
+
+function updateCharucoPreviewLoop() {
+  const shouldRun = transformationMode === "charuco";
+  if (shouldRun === charucoPreviewRunning) {
+    return;
+  }
+  charucoPreviewRunning = shouldRun;
+  charucoPreviewGeneration += 1;
+  if (shouldRun) {
+    charucoPreviewStatus.textContent = "Waiting for camera preview…";
+    runCharucoPreview(charucoPreviewGeneration);
+  } else {
+    charucoPreviewStatus.textContent = "Preview inactive in JSON mode.";
+  }
 }
 
 async function captureCameraFrame() {
@@ -1061,7 +1261,12 @@ async function captureCameraFrame() {
 
 async function sendCommand(command) {
   updateControls(true);
-  setMessage(`${command.charAt(0).toUpperCase() + command.slice(1)} requested…`);
+  const commandLabel = command.charAt(0).toUpperCase() + command.slice(1);
+  setMessage(
+    ["pause", "stop"].includes(command)
+      ? `${commandLabel} requested; aligning and saving point clouds…`
+      : `${commandLabel} requested…`,
+  );
   try {
     const options = { method: "POST" };
     if (command === "start") {
@@ -1072,11 +1277,16 @@ async function sendCommand(command) {
     }
     const response = await fetch(`/api/recording/${command}`, options);
     const result = await response.json();
+    if (typeof result.state === "string") {
+      applyStatus(result);
+    }
     if (!response.ok) {
+      if (["pause", "stop"].includes(command)) {
+        clearPointCloud();
+      }
       throw new Error(result.message || `Cannot ${command} recording`);
     }
 
-    applyStatus(result);
     if (command === "start") {
       resetReplay();
       clearPointCloud();
@@ -1084,11 +1294,12 @@ async function sendCommand(command) {
         `Recording '${result.session_name}' filtered world-frame points.`,
       );
     } else if (command === "pause" || command === "stop") {
-      await loadPoints();
       if (command === "stop") {
         await loadSavedSessions();
       }
+      await loadPoints();
     } else {
+      clearPointCloud();
       setMessage("Recording resumed in the same SQLite session.");
     }
   } catch (error) {
@@ -1128,7 +1339,9 @@ themeToggle.addEventListener("click", () => {
   setTheme(nextTheme, true);
 });
 sessionNameInput.addEventListener("input", () => updateControls());
+transformationModeSelect.addEventListener("change", setTransformationMode);
 publishTransformationButton.addEventListener("click", publishTransformation);
+charucoCaptureButton.addEventListener("click", captureCharuco);
 previousTransformationButton.addEventListener("click", () =>
   stepTransformation(-1),
 );
@@ -1229,6 +1442,7 @@ function animate() {
 }
 
 setTheme(document.documentElement.dataset.theme);
+showTransformationMode();
 resetView();
 animate();
 loadStatus();

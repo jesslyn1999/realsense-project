@@ -36,6 +36,8 @@ using namespace std::chrono_literals;
 
 namespace {
 
+constexpr int64_t MAX_COLOR_DEPTH_TIMESTAMP_DELTA_US = 50'000;
+
 int64_t getSystemNowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::system_clock::now().time_since_epoch())
@@ -1692,19 +1694,29 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
 void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
   if (!depth_registration_cloud_pub_ ||
       depth_registration_cloud_pub_->get_subscription_count() == 0 ||
-      !enable_colored_point_cloud_ || !depth_frame_) {
+      !enable_colored_point_cloud_ || !frame_set) {
     return;
   }
 
-  CHECK_NOTNULL(depth_frame_.get());
   std::lock_guard<decltype(point_cloud_mutex_)> point_cloud_msg_lock(point_cloud_mutex_);
-  if (!depth_frame_) {
-    RCLCPP_ERROR_STREAM(logger_, "depth frame is null");
-    return;
-  }
-  auto depth_frame = depth_frame_->as<ob::DepthFrame>();
+  auto depth_frame = frame_set->depthFrame();
   auto color_frame = frame_set->colorFrame();
   if (!depth_frame || !color_frame) {
+    return;
+  }
+  const auto depth_timestamp_us = static_cast<int64_t>(getFrameTimestampUs(depth_frame));
+  const auto color_timestamp_us = static_cast<int64_t>(getFrameTimestampUs(color_frame));
+  const auto timestamp_delta_us = color_timestamp_us - depth_timestamp_us;
+  if (std::abs(timestamp_delta_us) > MAX_COLOR_DEPTH_TIMESTAMP_DELTA_US) {
+    RCLCPP_ERROR_STREAM_THROTTLE(
+        logger_, *node_->get_clock(), 1000,
+        "Dropping colored point cloud: RGB/depth timestamp delta " << timestamp_delta_us
+                                                                   << " us exceeds "
+                                                                   << MAX_COLOR_DEPTH_TIMESTAMP_DELTA_US
+                                                                   << " us (RGB="
+                                                                   << color_timestamp_us
+                                                                   << ", depth="
+                                                                   << depth_timestamp_us << ")");
     return;
   }
   auto depth_width = depth_frame->width();
@@ -1965,8 +1977,8 @@ void OBCameraNode::onNewColorFrameCallback() {
 
     std::shared_ptr<ob::FrameSet> frameSet = color_frame_queue_.front();
     is_color_frame_decoded_ = decodeColorFrameToBuffer(frameSet->colorFrame(), rgb_buffer_);
-    publishPointCloud(frameSet);
     onNewFrameCallback(frameSet->colorFrame(), COLOR);
+    publishPointCloud(frameSet);
     color_frame_queue_.pop();
   }
 

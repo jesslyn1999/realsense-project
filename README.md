@@ -82,7 +82,8 @@ modify or launch the RealSense scanner packages.
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install \
   --packages-select orbbec_camera_msgs orbbec_camera \
-  object_scanner_interfaces object_scanner_web_orbbec \
+  object_scanner_interfaces object_scanner_processing \
+  object_scanner_web_orbbec \
   --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Debug
 source install/setup.bash

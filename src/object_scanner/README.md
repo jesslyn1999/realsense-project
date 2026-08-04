@@ -105,6 +105,14 @@ An existing session directory is never overwritten: Start returns
 the database open and drops incoming frames, so a reader can inspect everything
 recorded so far. Resuming appends to the same database.
 
+Every Pause and Stop synchronously recomputes
+`<output_directory>/<session_name>/aligned_recording.sqlite3`. This derived
+database contains cleaned/aligned per-frame clouds with optimized poses, the
+fused cloud, observation counts, and processing diagnostics. It is refreshed
+as one transaction, so a failure retains the previous complete aligned result
+while the recorder remains paused or stopped. The raw `recording.sqlite3` is
+never modified by refinement.
+
 Stopping atomically adds `metadata.json` with one entry per recorded SQLite
 frame: its database ID, source timestamp, transformation name, parent frame,
 and exact 4×4 matrix. It then checkpoints the WAL, switches the database to

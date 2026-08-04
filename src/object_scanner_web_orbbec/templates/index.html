@@ -72,33 +72,79 @@
 
         <section aria-labelledby="transformation-heading">
           <h2 id="transformation-heading">Transformation</h2>
-          <div class="transformation-value">
-            <div>
-              <strong id="transformation-name">current</strong>
-              <span id="transformation-parent-frame">Parent frame: world</span>
+          <label
+            class="select-field transformation-mode-field"
+            for="transformation-mode"
+          >
+            <span>Mode</span>
+            <select id="transformation-mode">
+              <option value="json">JSON matrices</option>
+              <option value="charuco">ChArUco board</option>
+            </select>
+          </label>
+
+          <div id="json-transformation-panel">
+            <div class="transformation-value">
+              <div>
+                <strong id="transformation-name">current</strong>
+                <span id="transformation-parent-frame">Parent frame: world</span>
+              </div>
+              <span id="transformation-position" class="transformation-position">
+                Matrix 1 / 4
+              </span>
             </div>
-            <span id="transformation-position" class="transformation-position">
-              Matrix 1 / 4
-            </span>
-          </div>
-          <div class="transformation-nav">
-            <button id="previous-transformation-button">← Previous</button>
-            <button id="next-transformation-button">Next →</button>
-          </div>
-          <pre
-            id="transformation-matrix"
-            class="matrix-preview"
-            aria-label="Transformation matrix to publish"
-          >[1, 0, 0, 0]
+            <div class="transformation-nav">
+              <button id="previous-transformation-button">← Previous</button>
+              <button id="next-transformation-button">Next →</button>
+            </div>
+            <pre
+              id="transformation-matrix"
+              class="matrix-preview"
+              aria-label="Transformation matrix to publish"
+            >[1, 0, 0, 0]
 [0, 1, 0, 0]
 [0, 0, 1, 0]
 [0, 0, 0, 1]</pre>
-          <button id="publish-transformation-button" class="primary">
-            Publish transformation matrix
-          </button>
-          <p class="hint">
-            Publishes this matrix for the next point-cloud frame.
-          </p>
+            <button id="publish-transformation-button" class="primary">
+              Publish transformation matrix
+            </button>
+            <p class="hint">
+              Publishes this matrix for the next point-cloud frame.
+            </p>
+          </div>
+
+          <div id="charuco-transformation-panel" hidden>
+            <div class="charuco-preview-shell">
+              <canvas
+                id="charuco-preview"
+                aria-label="Live ChArUco detection preview"
+              ></canvas>
+              <p id="charuco-preview-status" class="hint">
+                Waiting for camera preview…
+              </p>
+            </div>
+            <dl class="stats charuco-metrics">
+              <div>
+                <dt>Detected corners</dt>
+                <dd id="charuco-corner-count">—</dd>
+              </div>
+              <div>
+                <dt>Reprojection RMSE</dt>
+                <dd id="charuco-rmse">—</dd>
+              </div>
+            </dl>
+            <pre
+              id="charuco-matrix"
+              class="matrix-preview"
+              aria-label="Latest accepted ChArUco camera-to-world matrix"
+            >No accepted capture</pre>
+            <button id="charuco-capture-button" class="primary">
+              Capture
+            </button>
+            <p class="hint">
+              Requires 20 corners and reprojection RMSE ≤ 1.5 px.
+            </p>
+          </div>
         </section>
 
         <section aria-labelledby="color-heading">

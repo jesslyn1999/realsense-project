@@ -1,6 +1,7 @@
 import numpy as np
 from object_scanner_web.camera_frame import (
     build_camera_payload,
+    build_rgb_payload,
     CAMERA_HEADER,
     CAMERA_MAGIC,
     image_to_rgb,
@@ -41,3 +42,13 @@ def test_bgr_image_is_converted_to_rgb():
         image_to_rgb(message),
         [[[1, 2, 3], [4, 5, 6]]],
     )
+
+
+def test_rgb_array_payload_preserves_dimensions_and_pixels():
+    image = np.array([[[1, 2, 3], [4, 5, 6]]], dtype=np.uint8)
+
+    payload = build_rgb_payload(image)
+
+    magic, width, height = CAMERA_HEADER.unpack_from(payload)
+    assert (magic, width, height) == (CAMERA_MAGIC, 2, 1)
+    assert payload[CAMERA_HEADER.size:] == image.tobytes()

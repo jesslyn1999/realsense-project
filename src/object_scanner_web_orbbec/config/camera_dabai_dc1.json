@@ -1,0 +1,15 @@
+{
+    "camera_name": "camera",
+    "device_num": 1,
+    "uvc_backend": "libuvc",
+    "depth_registration": true,
+    "align_mode": "HW",
+    "enable_point_cloud": false,
+    "enable_colored_point_cloud": true,
+    "enable_ir": false,
+    "color_qos": "SENSOR_DATA",
+    "depth_qos": "SENSOR_DATA",
+    "point_cloud_qos": "SENSOR_DATA",
+    "enable_frame_sync": true,
+    "frame_aggregate_mode": "full_frame"
+}

@@ -17,6 +17,7 @@ setup(
         ),
         ("share/" + package_name, ["package.xml", "README.md"]),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
+        ("share/" + package_name + "/config", glob("config/*.json")),
         (
             "share/" + package_name + "/resource",
             glob("resource/*.json"),

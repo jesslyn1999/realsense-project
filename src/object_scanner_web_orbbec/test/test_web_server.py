@@ -2,14 +2,21 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
+from object_scanner_processing.charuco_observations import (
+    CharucoCalibration,
+    CharucoCalibrationError,
+    CharucoFrameObservation,
+)
 from object_scanner_web_orbbec.sqlite_recording import SqliteRecording
+import object_scanner_web_orbbec.web_server as web_server
 from object_scanner_web_orbbec.web_server import create_app, RosControlBridge
 import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from std_srvs.srv import Trigger
 
 
@@ -25,6 +32,24 @@ IDENTITY_TRANSFORMATION = {
 }
 
 
+def make_charuco_observation(corner_count=42):
+    return CharucoFrameObservation(
+        corner_ids=np.arange(corner_count, dtype=np.int32),
+        image_points=np.zeros((corner_count, 2)),
+        depth_valid=np.ones(corner_count, dtype=bool),
+        child_points=np.zeros((corner_count, 3)),
+        depth_valid_pixel_counts=np.full(corner_count, 25, dtype=np.uint16),
+        depth_inlier_pixel_counts=np.full(corner_count, 25, dtype=np.uint16),
+        depth_mad_m=np.zeros(corner_count),
+        depth_invalid_reasons=tuple("" for _ in range(corner_count)),
+        camera_matrix=np.eye(3),
+        distortion=np.zeros(5),
+        color_from_child=np.eye(4),
+        initial_reprojection_errors_px=np.full(corner_count, 0.4),
+        initial_reprojection_rmse_px=0.4,
+    )
+
+
 class FakeBridge:
     def __init__(self, database_path):
         self.state = "stopped"
@@ -33,6 +58,8 @@ class FakeBridge:
         self.session_name = None
         self.target_rgb = [0, 255, 0]
         self.transformation = IDENTITY_TRANSFORMATION
+        self.transformation_mode = "json"
+        self.last_charuco = None
 
     def status(self):
         return {
@@ -44,6 +71,8 @@ class FakeBridge:
             "transformation_index": 1,
             "transformation_total": 1,
             "transform_burst_active": False,
+            "transformation_mode": self.transformation_mode,
+            "last_charuco": self.last_charuco,
         }
 
     def refresh_status(self):
@@ -89,6 +118,11 @@ class FakeBridge:
         return message
 
     def publish_transformation(self):
+        if self.transformation_mode != "json":
+            raise RuntimeError(
+                "JSON transformation publishing is unavailable "
+                "in ChArUco mode"
+            )
         return {
             **self.status(),
             "success": True,
@@ -99,7 +133,54 @@ class FakeBridge:
     def step_transformation(self, delta):
         if delta not in {-1, 1}:
             raise ValueError("delta must be -1 or 1")
+        if self.transformation_mode != "json":
+            raise RuntimeError(
+                "JSON transformation selection is unavailable "
+                "in ChArUco mode"
+            )
         return self.status()
+
+    def set_transformation_mode(self, mode):
+        if self.state != "stopped":
+            return {
+                **self.status(),
+                "success": False,
+                "message": "Transformation mode can change only while stopped",
+            }
+        self.transformation_mode = mode
+        return {
+            **self.status(),
+            "success": True,
+            "message": f"Transformation mode set to {mode}",
+        }
+
+    def capture_charuco(self):
+        if self.transformation_mode != "charuco":
+            raise RuntimeError("ChArUco capture is unavailable in JSON mode")
+        if self.state != "recording":
+            raise RuntimeError(
+                "ChArUco capture is available only while recording"
+            )
+        self.last_charuco = {
+            "success": True,
+            "message": "ChArUco pose accepted",
+            "corner_count": 54,
+            "reprojection_rmse_px": 0.25,
+            "matrix": np.eye(4).tolist(),
+        }
+        return {
+            **self.status(),
+            "success": True,
+            "message": "Captured one ChArUco-calibrated point cloud",
+            "charuco_capture": self.last_charuco,
+        }
+
+    def build_charuco_preview(self):
+        if self.transformation_mode != "charuco":
+            raise RuntimeError(
+                "ChArUco preview is unavailable in JSON mode"
+            )
+        return np.array([[[1, 2, 3], [4, 5, 6]]], dtype=np.uint8)
 
 
 class RejectingBridge(FakeBridge):
@@ -121,7 +202,20 @@ class TransformationBusyBridge(FakeBridge):
         raise RuntimeError("A transformation burst is already active")
 
 
-def test_flask_controls_and_serves_paused_points(tmp_path):
+class CharucoRejectingBridge(FakeBridge):
+    def capture_charuco(self):
+        raise CharucoCalibrationError(
+            "ChArUco capture requires at least 20 corners; detected 8",
+            corner_count=8,
+        )
+
+
+class NoImageBridge(FakeBridge):
+    def build_charuco_preview(self):
+        raise TimeoutError("No RGB image received")
+
+
+def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
     recording = SqliteRecording(tmp_path / "scan")
     database_path = recording.path
     recording.append_frame(
@@ -133,6 +227,27 @@ def test_flask_controls_and_serves_paused_points(tmp_path):
         transformation_matrix=np.eye(4),
         xyz=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
         rgb=np.array([[0, 255, 0]], dtype=np.uint8),
+    )
+    aligned_reads = []
+
+    def fake_read_fused_cloud(path, revision):
+        aligned_reads.append((path, revision))
+        return SimpleNamespace(
+            xyz=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+            rgb=np.array([[0, 255, 0]], dtype=np.uint8),
+            raw_points=1,
+            cleaned_points=1,
+            accepted_edges=1,
+            rejected_edges=0,
+            charuco_frame_count=1,
+            charuco_reprojection_max_px=0.4,
+            cloud_overlap_fraction_3mm=0.995,
+        )
+
+    monkeypatch.setattr(
+        web_server,
+        "read_fused_cloud",
+        fake_read_fused_cloud,
     )
 
     share_directory = Path(__file__).parents[1]
@@ -150,6 +265,12 @@ def test_flask_controls_and_serves_paused_points(tmp_path):
         assert b'id="camera-preview"' in page.data
         assert b'id="pixel-loupe"' in page.data
         assert b'id="publish-transformation-button"' in page.data
+        assert b'id="transformation-mode"' in page.data
+        assert b'id="json-transformation-panel"' in page.data
+        assert b'id="charuco-transformation-panel"' in page.data
+        assert b'id="charuco-preview"' in page.data
+        assert b'id="charuco-preview-status"' in page.data
+        assert b'id="charuco-capture-button"' in page.data
         assert b'id="previous-transformation-button"' in page.data
         assert b'id="next-transformation-button"' in page.data
         assert b'id="transformation-position"' in page.data
@@ -168,6 +289,7 @@ def test_flask_controls_and_serves_paused_points(tmp_path):
         assert status["transformation"] == IDENTITY_TRANSFORMATION
         assert status["transformation_index"] == 1
         assert status["transformation_total"] == 1
+        assert status["transformation_mode"] == "json"
         response = client.post("/api/transformation/publish")
         assert response.status_code == 200
         assert (
@@ -235,11 +357,131 @@ def test_flask_controls_and_serves_paused_points(tmp_path):
         assert response.status_code == 200
         assert response.headers["X-Displayed-Points"] == "1"
         assert response.headers["X-Total-Points"] == "1"
+        assert response.headers["X-Raw-Points"] == "1"
+        assert response.headers["X-Cleaned-Points"] == "1"
+        assert response.headers["X-Accepted-Edges"] == "1"
+        assert response.headers["X-Rejected-Edges"] == "0"
+        assert response.headers["X-Charuco-Frames"] == "1"
+        assert response.headers["X-Charuco-Max-Reprojection-Px"] == "0.4"
+        assert response.headers["X-Cloud-3mm-Fraction"] == "0.995"
         assert response.data[:4] == b"PCD1"
+        assert len(aligned_reads) == 1
+        assert aligned_reads[0][0].name == "aligned_recording.sqlite3"
+        assert aligned_reads[0][1].frame_count == 1
+        assert client.get("/api/points").status_code == 200
+        assert len(aligned_reads) == 2
+
+        assert client.post("/api/recording/resume").status_code == 200
+        recording.append_frame(
+            recorded_perf_counter_ns=2,
+            source_sec=3,
+            source_nanosec=4,
+            frame_id="world",
+            transformation_name="identity",
+            transformation_matrix=np.eye(4),
+            xyz=np.array([[2.0, 3.0, 4.0]], dtype=np.float32),
+            rgb=np.array([[0, 255, 0]], dtype=np.uint8),
+        )
+        assert client.post("/api/recording/pause").status_code == 200
+        assert client.get("/api/points").status_code == 200
+        assert len(aligned_reads) == 3
+        assert aligned_reads[-1][1].frame_count == 2
 
         assert client.post("/api/recording/invalid").status_code == 404
     finally:
         recording.close()
+
+
+def test_points_refuses_missing_or_stale_aligned_output(tmp_path, monkeypatch):
+    recording = SqliteRecording(tmp_path / "scan")
+    database_path = recording.path
+    recording.append_frame(
+        recorded_perf_counter_ns=1,
+        source_sec=2,
+        source_nanosec=3,
+        frame_id="world",
+        transformation_name="identity",
+        transformation_matrix=np.eye(4),
+        xyz=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+        rgb=np.array([[0, 255, 0]], dtype=np.uint8),
+    )
+
+    def reject_aligned_output(_path, _revision):
+        raise web_server.AlignedRecordingError(
+            "aligned recording does not match the current raw recording"
+        )
+
+    monkeypatch.setattr(
+        web_server,
+        "read_fused_cloud",
+        reject_aligned_output,
+    )
+    app = create_app(
+        FakeBridge(database_path),
+        Path(__file__).parents[1],
+        output_directory=tmp_path,
+    )
+    response = app.test_client().get("/api/points")
+    recording.close()
+
+    assert response.status_code == 422
+    assert not response.json["success"]
+    assert "does not match" in response.json["message"]
+
+
+def test_points_reads_saved_output_after_raw_wal_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    recording = SqliteRecording(tmp_path / "scan")
+    database_path = recording.path
+    recording.append_frame(
+        recorded_perf_counter_ns=1,
+        source_sec=2,
+        source_nanosec=3,
+        frame_id="world",
+        transformation_name="identity",
+        transformation_matrix=np.eye(4),
+        xyz=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+        rgb=np.array([[0, 255, 0]], dtype=np.uint8),
+    )
+    aligned_reads = []
+
+    def fake_read_fused_cloud(path, revision):
+        aligned_reads.append((path, revision))
+        return SimpleNamespace(
+            xyz=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+            rgb=np.array([[0, 255, 0]], dtype=np.uint8),
+            raw_points=1,
+            cleaned_points=1,
+            accepted_edges=1,
+            rejected_edges=0,
+            charuco_frame_count=0,
+            charuco_reprojection_max_px=None,
+            cloud_overlap_fraction_3mm=None,
+        )
+
+    monkeypatch.setattr(
+        web_server,
+        "read_fused_cloud",
+        fake_read_fused_cloud,
+    )
+    client = create_app(
+        FakeBridge(database_path),
+        Path(__file__).parents[1],
+        output_directory=tmp_path,
+    ).test_client()
+    closed = False
+    try:
+        assert client.get("/api/points").status_code == 200
+        recording.close()
+        closed = True
+        assert client.get("/api/points").status_code == 200
+        assert len(aligned_reads) == 2
+        assert aligned_reads[0][1] == aligned_reads[1][1]
+    finally:
+        if not closed:
+            recording.close()
 
 
 def test_flask_lists_and_replays_only_finalized_session_folders(tmp_path):
@@ -314,6 +556,52 @@ def test_flask_returns_conflict_for_rejected_ros_command(tmp_path, capfd):
     assert "Stack (most recent call last)" in stderr
 
 
+def test_bridge_refreshes_state_after_alignment_failure(monkeypatch):
+    class CompletedFuture:
+        def add_done_callback(self, callback):
+            callback(self)
+
+        def result(self):
+            response = Trigger.Response()
+            response.success = False
+            response.message = "Recording paused, but aligned output failed"
+            return response
+
+    class FailedPauseClient:
+        def wait_for_service(self, timeout_sec):
+            return True
+
+        def call_async(self, request):
+            return CompletedFuture()
+
+    rclpy.init()
+    bridge = RosControlBridge(TRANSFORMATION_PATH)
+    refresh_count = 0
+
+    def refresh_status():
+        nonlocal refresh_count
+        refresh_count += 1
+        bridge._state = "recording" if refresh_count == 1 else "paused"
+        bridge._database_path = "/tmp/scan/recording.sqlite3"
+        bridge._session_name = "scan"
+
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_scanner_status_unlocked",
+        refresh_status,
+    )
+    bridge._service_clients["pause"] = FailedPauseClient()
+    try:
+        result = bridge.command("pause")
+
+        assert not result["success"]
+        assert result["state"] == "paused"
+        assert refresh_count == 2
+    finally:
+        bridge.destroy_node()
+        rclpy.shutdown()
+
+
 def test_transformation_endpoint_reports_busy_and_timeout(tmp_path):
     share_directory = Path(__file__).parents[1]
 
@@ -334,6 +622,81 @@ def test_transformation_endpoint_reports_busy_and_timeout(tmp_path):
         busy_app.test_client().post("/api/transformation/publish").status_code
         == 409
     )
+
+
+def test_transformation_mode_and_charuco_routes(tmp_path):
+    share_directory = Path(__file__).parents[1]
+    bridge = FakeBridge(tmp_path / "unused.sqlite3")
+    client = create_app(bridge, share_directory).test_client()
+
+    assert (
+        client.post(
+            "/api/transformation/mode",
+            json={"mode": "invalid"},
+        ).status_code
+        == 400
+    )
+    assert client.post("/api/charuco/capture").status_code == 409
+    assert client.get("/api/charuco/preview").status_code == 409
+
+    response = client.post(
+        "/api/transformation/mode",
+        json={"mode": "charuco"},
+    )
+    assert response.status_code == 200
+    assert response.json["transformation_mode"] == "charuco"
+    preview = client.get("/api/charuco/preview")
+    assert preview.status_code == 200
+    assert preview.data[:4] == b"RGB1"
+    assert preview.headers["X-Image-Width"] == "2"
+    assert preview.headers["X-Image-Height"] == "1"
+    assert client.post("/api/charuco/capture").status_code == 409
+    assert client.post("/api/transformation/publish").status_code == 409
+    assert (
+        client.post(
+            "/api/transformation/step",
+            json={"delta": 1},
+        ).status_code
+        == 409
+    )
+
+    bridge.state = "recording"
+    assert client.get("/api/charuco/preview").status_code == 200
+    assert (
+        client.post(
+            "/api/transformation/mode",
+            json={"mode": "json"},
+        ).status_code
+        == 409
+    )
+    response = client.post("/api/charuco/capture")
+    assert response.status_code == 200
+    assert response.json["charuco_capture"]["corner_count"] == 54
+    assert response.json["charuco_capture"]["reprojection_rmse_px"] == 0.25
+    bridge.state = "paused"
+    assert client.get("/api/charuco/preview").status_code == 200
+
+    rejecting_bridge = CharucoRejectingBridge(
+        tmp_path / "rejected.sqlite3"
+    )
+    rejecting_bridge.transformation_mode = "charuco"
+    rejecting_bridge.state = "recording"
+    rejecting_client = create_app(
+        rejecting_bridge,
+        share_directory,
+    ).test_client()
+    response = rejecting_client.post("/api/charuco/capture")
+    assert response.status_code == 422
+    assert response.json["corner_count"] == 8
+    assert response.json["reprojection_rmse_px"] is None
+
+    no_image_bridge = NoImageBridge(tmp_path / "no-image.sqlite3")
+    no_image_bridge.transformation_mode = "charuco"
+    no_image_client = create_app(
+        no_image_bridge,
+        share_directory,
+    ).test_client()
+    assert no_image_client.get("/api/charuco/preview").status_code == 503
 
 
 def test_ros_control_bridge_can_spin():
@@ -399,6 +762,207 @@ def test_ros_control_bridge_can_spin():
         assert not state_lock_blocked_callback
     finally:
         executor.shutdown()
+        bridge.destroy_node()
+        rclpy.shutdown()
+
+
+def test_charuco_sensor_frame_requires_matching_camera_frames():
+    cloud = PointCloud2()
+    cloud.header.frame_id = "camera_color_optical_frame"
+    image = Image()
+    image.header.frame_id = "wrong_frame"
+    depth = Image()
+    depth.header.frame_id = cloud.header.frame_id
+    camera_info = CameraInfo()
+    camera_info.header.frame_id = cloud.header.frame_id
+
+    with pytest.raises(CharucoCalibrationError, match="RGB image frame"):
+        RosControlBridge._calibrate_sensor_frame(
+            cloud,
+            image,
+            depth,
+            camera_info,
+        )
+    with pytest.raises(CharucoCalibrationError, match="No camera intrinsics"):
+        RosControlBridge._calibrate_sensor_frame(
+            cloud,
+            image,
+            depth,
+            None,
+        )
+
+
+def test_ros_bridge_charuco_capture_publishes_one_synchronized_pose(
+    monkeypatch,
+):
+    class FakePublisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    camera_to_world = np.eye(4)
+    camera_to_world[:3, 3] = [0.1, -0.2, 0.3]
+    calibration = CharucoCalibration(
+        camera_to_world=camera_to_world,
+        corner_count=42,
+        reprojection_rmse_px=0.4,
+    )
+    monkeypatch.setattr(
+        "object_scanner_web_orbbec.web_server.calibrate_charuco",
+        lambda *_args: calibration,
+    )
+    observation = make_charuco_observation()
+    monkeypatch.setattr(
+        "object_scanner_web_orbbec.web_server.build_charuco_observation",
+        lambda *_args: observation,
+    )
+
+    rclpy.init()
+    bridge = RosControlBridge(TRANSFORMATION_PATH)
+    bridge._refresh_scanner_status_unlocked = lambda: None
+    bridge._transform_publisher = FakePublisher()
+    try:
+        assert bridge.set_transformation_mode("charuco")["success"]
+        with pytest.raises(TimeoutError, match="No RGB image received"):
+            bridge.build_charuco_preview()
+        bridge._state = "recording"
+
+        camera_info = CameraInfo()
+        camera_info.header.frame_id = "camera_color_optical_frame"
+        camera_info.width = 1
+        camera_info.height = 1
+        camera_info.k = [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+
+        cloud = PointCloud2()
+        cloud.header.stamp.sec = 4
+        cloud.header.stamp.nanosec = 5
+        cloud.header.frame_id = "camera_color_optical_frame"
+        image = Image()
+        image.header.stamp = cloud.header.stamp
+        image.header.frame_id = cloud.header.frame_id
+        image.width = 1
+        image.height = 1
+        image.step = 3
+        image.encoding = "rgb8"
+        image.data = bytes([0, 255, 0])
+        depth = Image()
+        depth.header.stamp = cloud.header.stamp
+        depth.header.frame_id = cloud.header.frame_id
+        depth.width = 1
+        depth.height = 1
+        depth.step = 2
+        depth.encoding = "16UC1"
+        depth.data = np.array([500], dtype="<u2").tobytes()
+        bridge._on_color_image(image)
+        np.testing.assert_array_equal(
+            bridge.build_charuco_preview(),
+            [[[0, 255, 0]]],
+        )
+
+        results = []
+        errors = []
+
+        def capture():
+            try:
+                results.append(bridge.capture_charuco(timeout_s=1.0))
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=capture)
+        thread.start()
+        deadline = time.perf_counter() + 1.0
+        while not bridge.status()["transform_burst_active"]:
+            assert time.perf_counter() < deadline
+            time.sleep(0.001)
+
+        bridge._on_synchronized_sensor_frame(
+            cloud,
+            image,
+            depth,
+            camera_info,
+        )
+        thread.join(timeout=1.0)
+
+        assert not thread.is_alive()
+        assert not errors
+        assert results[0]["charuco_capture"]["corner_count"] == 42
+        assert len(bridge._transform_publisher.messages) == 1
+        message = bridge._transform_publisher.messages[0]
+        assert message.header.stamp.sec == 4
+        assert message.header.stamp.nanosec == 5
+        assert message.header.frame_id == "world"
+        assert message.child_frame_id == "camera_color_optical_frame"
+        assert message.transformation_name == "charuco"
+        np.testing.assert_allclose(
+            np.asarray(message.matrix).reshape(4, 4),
+            camera_to_world,
+        )
+        assert list(message.charuco_observation.corner_ids) == list(range(42))
+        assert results[0]["charuco_capture"][
+            "valid_depth_corner_count"
+        ] == 42
+
+        bridge._on_synchronized_sensor_frame(
+            cloud,
+            image,
+            depth,
+            camera_info,
+        )
+        assert len(bridge._transform_publisher.messages) == 1
+
+        with pytest.raises(
+            TimeoutError,
+            match="Did not receive synchronized RGB",
+        ):
+            bridge.capture_charuco(timeout_s=0.001)
+        assert not bridge.status()["transform_burst_active"]
+        assert len(bridge._transform_publisher.messages) == 1
+
+        def reject(*_args):
+            raise CharucoCalibrationError(
+                "ChArUco capture requires at least 20 corners; detected 7",
+                corner_count=7,
+            )
+
+        monkeypatch.setattr(
+            "object_scanner_web_orbbec.web_server.calibrate_charuco",
+            reject,
+        )
+        results.clear()
+        thread = threading.Thread(target=capture)
+        thread.start()
+        deadline = time.perf_counter() + 1.0
+        while not bridge.status()["transform_burst_active"]:
+            assert time.perf_counter() < deadline
+            time.sleep(0.001)
+        bridge._on_synchronized_sensor_frame(
+            cloud,
+            image,
+            depth,
+            camera_info,
+        )
+        thread.join(timeout=1.0)
+
+        assert not thread.is_alive()
+        assert not results
+        assert len(errors) == 1
+        assert isinstance(errors[0], CharucoCalibrationError)
+        assert errors[0].corner_count == 7
+        assert len(bridge._transform_publisher.messages) == 1
+    finally:
+        thread.join(timeout=1.0)
         bridge.destroy_node()
         rclpy.shutdown()
 

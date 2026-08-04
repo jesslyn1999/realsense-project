@@ -10,6 +10,7 @@ import numpy as np
 
 PAYLOAD_HEADER = struct.Struct("<4sII")
 PAYLOAD_MAGIC = b"PCD1"
+REPLAY_STAGES = frozenset(("raw", "filtered", "aligned"))
 
 
 def list_frames(database_path: Path) -> list[dict]:
@@ -98,6 +99,26 @@ def read_sampled_frame(
     )
 
 
+def read_frame_matrix(database_path: Path, frame_id: int) -> np.ndarray:
+    """Return one frame's validated camera-to-world matrix."""
+    uri = f"{database_path.resolve().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        row = connection.execute(
+            "SELECT transformation_matrix FROM frames WHERE id = ?",
+            (frame_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"Frame {frame_id} does not exist")
+
+    matrix = np.frombuffer(row[0], dtype="<f8")
+    if matrix.size != 16 or not np.isfinite(matrix).all():
+        raise ValueError(f"Frame {frame_id} contains an invalid matrix")
+    return matrix.reshape(4, 4).copy()
+
+
 def read_sampled_points(
     database_path: Path,
     max_points: int,
@@ -154,8 +175,36 @@ def read_sampled_points(
 def build_point_payload(database_path: Path, max_points: int) -> bytes:
     """Encode a sampled cloud for direct Three.js typed-array loading."""
     xyz, rgb, total_points = read_sampled_points(database_path, max_points)
-    header = PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, len(xyz), total_points)
-    return header + xyz.tobytes() + rgb.tobytes()
+    return build_array_payload(xyz, rgb, total_points)
+
+
+def build_array_payload(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    total_points: int | None = None,
+) -> bytes:
+    """Encode validated XYZ/RGB arrays using the existing PCD1 contract."""
+    points = np.asarray(xyz, dtype="<f4")
+    colors = np.asarray(rgb)
+    if points.ndim != 2 or points.shape[1:] != (3,):
+        raise ValueError("xyz must have shape (N, 3)")
+    if colors.shape != points.shape:
+        raise ValueError("rgb must have the same (N, 3) shape as xyz")
+    if not np.isfinite(points).all():
+        raise ValueError("xyz must contain only finite values")
+    if not np.issubdtype(colors.dtype, np.integer):
+        raise ValueError("rgb must contain integer values")
+    if np.any((colors < 0) | (colors > 255)):
+        raise ValueError("rgb values must be from 0 to 255")
+    if total_points is None:
+        total_points = len(points)
+    if total_points < len(points):
+        raise ValueError("total_points must not be smaller than displayed points")
+
+    points = np.ascontiguousarray(points, dtype="<f4")
+    colors = np.ascontiguousarray(colors, dtype=np.uint8)
+    header = PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, len(points), total_points)
+    return header + points.tobytes() + colors.tobytes()
 
 
 def build_frame_payload(
@@ -169,5 +218,35 @@ def build_frame_payload(
         frame_id,
         max_points,
     )
-    header = PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, len(xyz), total_points)
-    return header + xyz.tobytes() + rgb.tobytes()
+    return build_array_payload(xyz, rgb, total_points)
+
+
+def build_replay_frame_payload(
+    raw_database_path: Path,
+    aligned_database_path: Path,
+    frame_id: int,
+    max_points: int,
+    stage: str,
+) -> bytes:
+    """Encode one raw, filtered, or ICP-aligned replay frame."""
+    if stage not in REPLAY_STAGES:
+        raise ValueError(
+            f"stage must be one of {', '.join(sorted(REPLAY_STAGES))}"
+        )
+    if stage == "raw":
+        return build_frame_payload(raw_database_path, frame_id, max_points)
+
+    xyz, rgb, total_points = read_sampled_frame(
+        aligned_database_path,
+        frame_id,
+        max_points,
+    )
+    if stage == "filtered":
+        initial_pose = read_frame_matrix(raw_database_path, frame_id)
+        optimized_pose = read_frame_matrix(aligned_database_path, frame_id)
+        filtered_pose = initial_pose @ np.linalg.inv(optimized_pose)
+        xyz = (
+            xyz.astype(np.float64) @ filtered_pose[:3, :3].T
+            + filtered_pose[:3, 3]
+        ).astype("<f4")
+    return build_array_payload(xyz, rgb, total_points)

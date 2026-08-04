@@ -1,0 +1,13 @@
+int32[] corner_ids
+float64[] image_points
+bool[] depth_valid
+float64[] child_points
+uint16[] depth_valid_pixel_counts
+uint16[] depth_inlier_pixel_counts
+float64[] depth_mad_m
+string[] depth_invalid_reasons
+float64[9] camera_matrix
+float64[] distortion
+float64[16] color_from_child
+float64[] initial_reprojection_errors_px
+float64 initial_reprojection_rmse_px

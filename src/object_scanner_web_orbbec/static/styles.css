@@ -379,8 +379,33 @@ h2 {
   margin-bottom: 10px;
 }
 
-#publish-transformation-button {
+#publish-transformation-button,
+#charuco-capture-button {
   width: 100%;
+}
+
+.transformation-mode-field,
+.charuco-metrics {
+  margin-bottom: 10px;
+}
+
+.charuco-preview-shell {
+  overflow: hidden;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--surface-deep);
+}
+
+#charuco-preview {
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  background: var(--surface-deep);
+}
+
+#charuco-preview-status {
+  margin: 7px 10px 9px;
 }
 
 .color-value {

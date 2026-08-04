@@ -154,8 +154,36 @@ def read_sampled_points(
 def build_point_payload(database_path: Path, max_points: int) -> bytes:
     """Encode a sampled cloud for direct Three.js typed-array loading."""
     xyz, rgb, total_points = read_sampled_points(database_path, max_points)
-    header = PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, len(xyz), total_points)
-    return header + xyz.tobytes() + rgb.tobytes()
+    return build_array_payload(xyz, rgb, total_points)
+
+
+def build_array_payload(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    total_points: int | None = None,
+) -> bytes:
+    """Encode validated XYZ/RGB arrays using the existing PCD1 contract."""
+    points = np.asarray(xyz, dtype="<f4")
+    colors = np.asarray(rgb)
+    if points.ndim != 2 or points.shape[1:] != (3,):
+        raise ValueError("xyz must have shape (N, 3)")
+    if colors.shape != points.shape:
+        raise ValueError("rgb must have the same (N, 3) shape as xyz")
+    if not np.isfinite(points).all():
+        raise ValueError("xyz must contain only finite values")
+    if not np.issubdtype(colors.dtype, np.integer):
+        raise ValueError("rgb must contain integer values")
+    if np.any((colors < 0) | (colors > 255)):
+        raise ValueError("rgb values must be from 0 to 255")
+    if total_points is None:
+        total_points = len(points)
+    if total_points < len(points):
+        raise ValueError("total_points must not be smaller than displayed points")
+
+    points = np.ascontiguousarray(points, dtype="<f4")
+    colors = np.ascontiguousarray(colors, dtype=np.uint8)
+    header = PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, len(points), total_points)
+    return header + points.tobytes() + colors.tobytes()
 
 
 def build_frame_payload(
@@ -169,5 +197,4 @@ def build_frame_payload(
         frame_id,
         max_points,
     )
-    header = PAYLOAD_HEADER.pack(PAYLOAD_MAGIC, len(xyz), total_points)
-    return header + xyz.tobytes() + rgb.tobytes()
+    return build_array_payload(xyz, rgb, total_points)
