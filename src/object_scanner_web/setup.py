@@ -25,6 +25,10 @@ setup(
             "share/" + package_name + "/static",
             glob("static/*"),
         ),
+        (
+            "share/" + package_name + "/repair",
+            ["../../resources/pipe-testing08-repair(3).stl"],
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

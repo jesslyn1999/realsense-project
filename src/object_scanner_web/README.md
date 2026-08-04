@@ -73,6 +73,12 @@ frame. **Exit replay** returns to the normal viewer. A global 250,000-point
 display budget is shared across all replay frames. Replay is disabled until the
 active recording session has been stopped.
 
+The same launch also serves a simplified display remote at
+`http://<robot-ip>:5001/remote`. Keep one main viewer open on port 5000. The
+remote starts the fixed `demo5` replay, advances its cumulative frames, and can
+replace the main display with a full-screen loading message until **Stop
+loading** is clicked. **Next** is disabled when the final frame is visible.
+
 The replay dock's camera overlay checkbox shows the current frame's camera
 source, a 0.25 m optical +Z ray, and the standard red-X, green-Y, blue-Z axis
 guide using that frame's recorded transformation matrix.

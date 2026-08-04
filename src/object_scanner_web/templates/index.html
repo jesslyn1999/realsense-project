@@ -24,6 +24,12 @@
     </script>
   </head>
   <body>
+    <div id="remote-loading-overlay" class="remote-loading-overlay" hidden>
+      <div class="remote-loading-content">
+        <span class="remote-loading-spinner" aria-hidden="true"></span>
+        <p>Loading…</p>
+      </div>
+    </div>
     <main class="app-shell">
       <aside class="control-panel">
         <div class="control-panel-content">
@@ -219,6 +225,18 @@
           aria-haspopup="dialog"
           title="Capture workflow"
         >!</button>
+        <button
+          id="analyze-button"
+          class="viewer-analyze-button primary"
+          type="button"
+          disabled
+        >Analyze</button>
+        <button
+          id="adjust-repair-button"
+          class="viewer-adjust-repair-button"
+          type="button"
+          disabled
+        >Adjust repair</button>
         <div
           id="orientation-gizmo"
           class="orientation-gizmo"
@@ -271,6 +289,56 @@
             <button id="replay-previous-button">← Previous</button>
             <button id="replay-next-button" class="primary">Next →</button>
             <button id="replay-exit-button">Exit replay</button>
+          </div>
+        </div>
+        <div id="analysis-dock" class="analysis-dock" hidden>
+          <div class="analysis-dock-status">
+            <strong>Repair analysis</strong>
+            <span id="analysis-status">
+              Segmented repair-region points.
+            </span>
+          </div>
+          <div class="analysis-visibility-controls">
+            <label>
+              <input id="analysis-repair-visible" type="checkbox">
+              <span>Show adjusted repair</span>
+            </label>
+            <label>
+              <input id="analysis-segment-visible" type="checkbox" checked>
+              <span>Show segmented part</span>
+            </label>
+          </div>
+          <div id="analysis-edit-controls" hidden>
+            <div
+              class="analysis-mode-controls"
+              role="group"
+              aria-label="Repair transform mode"
+            >
+              <button id="analysis-move-button" type="button" aria-pressed="true">
+                Move
+              </button>
+              <button
+                id="analysis-rotate-button"
+                type="button"
+                aria-pressed="false"
+              >
+                Rotate
+              </button>
+              <button
+                id="analysis-scale-button"
+                type="button"
+                aria-pressed="false"
+              >
+                Scale
+              </button>
+            </div>
+            <div class="analysis-dock-controls">
+              <button id="analysis-reset-button" type="button">Reset</button>
+              <button id="analysis-cancel-button" type="button">Cancel</button>
+              <button id="analysis-apply-button" class="primary" type="button">
+                Apply placement
+              </button>
+            </div>
           </div>
         </div>
       </section>

@@ -13,7 +13,12 @@ from object_scanner_processing.charuco_observations import (
     CharucoFrameObservation,
 )
 import object_scanner_web.web_server as web_server
-from object_scanner_web.web_server import create_app, RosControlBridge
+from object_scanner_web.web_server import (
+    create_app,
+    create_remote_app,
+    RemoteControl,
+    RosControlBridge,
+)
 import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -282,6 +287,15 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert b'id="session-name"' in page.data
         assert b'id="saved-session"' in page.data
         assert b'id="replay-dock"' in page.data
+        assert b'id="analyze-button"' in page.data
+        assert b'id="adjust-repair-button"' in page.data
+        assert b'id="analysis-dock"' in page.data
+        assert b'id="analysis-repair-visible"' in page.data
+        assert b'id="analysis-segment-visible"' in page.data
+        assert b'id="analysis-move-button"' in page.data
+        assert b'id="analysis-rotate-button"' in page.data
+        assert b'id="analysis-scale-button"' in page.data
+        assert b'id="analysis-apply-button"' in page.data
         assert b'id="replay-previous-button"' in page.data
         assert b'id="replay-next-button"' in page.data
         assert b'id="replay-exit-button"' in page.data
@@ -293,12 +307,15 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert b'id="point-coordinate-tooltip"' in page.data
         assert b'id="scan-help-button"' in page.data
         assert b'id="scan-help-dialog"' in page.data
+        assert b'id="remote-loading-overlay"' in page.data
         assert b"Move in small steps" in page.data
         assert b"Keep at least 60%" in page.data
         app_javascript = client.get("/static/app.js")
         assert app_javascript.status_code == 200
         assert b"camera.up.set(0, 0, 1);" in app_javascript.data
         assert b"grid.rotation.x = Math.PI / 2;" in app_javascript.data
+        assert b"TransformControls" in app_javascript.data
+        assert b"STLLoader" in app_javascript.data
         status = client.get("/api/status").json
         assert status["state"] == "stopped"
         assert status["transformation"] == IDENTITY_TRANSFORMATION
@@ -409,6 +426,132 @@ def test_flask_controls_and_serves_paused_points(tmp_path, monkeypatch):
         assert client.post("/api/recording/invalid").status_code == 404
     finally:
         recording.close()
+
+
+def test_remote_page_queues_commands_and_tracks_main_viewer(tmp_path):
+    share_directory = Path(__file__).parents[1]
+    remote_control = RemoteControl()
+    main_client = create_app(
+        FakeBridge(tmp_path / "unused.sqlite3"),
+        share_directory,
+        remote_control=remote_control,
+    ).test_client()
+    remote_app = create_remote_app(remote_control, share_directory)
+    remote_client = remote_app.test_client()
+
+    page = remote_client.get("/remote")
+    assert page.status_code == 200
+    assert b'id="remote-start-replay"' in page.data
+    assert b'id="remote-next"' in page.data
+    assert b'id="remote-show-loading"' in page.data
+    assert b'id="remote-stop-loading"' in page.data
+    assert b"Start replay demo5" in page.data
+    assert remote_client.get("/static/remote.js").status_code == 200
+
+    status = remote_client.get("/api/status").json
+    assert not status["connected"]
+    assert not status["can_next"]
+    assert status["pending_command"] is None
+
+    viewer_report = {
+        "replay_mode": False,
+        "replay_index": 0,
+        "replay_total": 0,
+        "can_next": False,
+        "loading_visible": False,
+        "busy": False,
+        "stage": "raw",
+    }
+    assert main_client.post(
+        "/api/remote/viewer",
+        json=viewer_report,
+    ).status_code == 200
+    assert remote_client.get("/api/status").json["connected"]
+
+    assert remote_client.post(
+        "/api/command",
+        json={"command": "unknown"},
+    ).status_code == 400
+    response = remote_client.post(
+        "/api/command",
+        json={"command": "start_replay"},
+    )
+    assert response.status_code == 202
+    command = response.json["pending_command"]
+    assert command["command"] == "start_replay"
+    assert remote_client.post(
+        "/api/command",
+        json={"command": "next"},
+    ).status_code == 409
+
+    pending = main_client.get("/api/remote/command").json
+    assert pending["command"] == command
+    assert pending["demo_session"] == "demo5"
+
+    completed_report = {
+        **viewer_report,
+        "replay_mode": True,
+        "replay_total": 2,
+        "can_next": True,
+        "completed_command_id": command["id"],
+        "error": None,
+    }
+    assert main_client.post(
+        "/api/remote/viewer",
+        json=completed_report,
+    ).status_code == 200
+    status = remote_client.get("/api/status").json
+    assert status["pending_command"] is None
+    assert status["replay_mode"]
+    assert status["can_next"]
+
+    response = remote_client.post(
+        "/api/command",
+        json={"command": "next"},
+    )
+    command = response.json["pending_command"]
+    completed_report.update(
+        replay_index=1,
+        can_next=False,
+        completed_command_id=command["id"],
+    )
+    assert main_client.post(
+        "/api/remote/viewer",
+        json=completed_report,
+    ).status_code == 200
+    assert not remote_client.get("/api/status").json["can_next"]
+
+    response = remote_client.post(
+        "/api/command",
+        json={"command": "show_loading"},
+    )
+    command = response.json["pending_command"]
+    completed_report.update(
+        loading_visible=True,
+        completed_command_id=command["id"],
+    )
+    assert main_client.post(
+        "/api/remote/viewer",
+        json=completed_report,
+    ).status_code == 200
+    assert main_client.get(
+        "/api/remote/command"
+    ).json["loading_visible"]
+
+    response = remote_client.post(
+        "/api/command",
+        json={"command": "stop_loading"},
+    )
+    command = response.json["pending_command"]
+    completed_report.update(
+        loading_visible=False,
+        completed_command_id=command["id"],
+    )
+    assert main_client.post(
+        "/api/remote/viewer",
+        json=completed_report,
+    ).status_code == 200
+    assert not remote_client.get("/api/status").json["loading_visible"]
 
 
 def test_points_refuses_missing_or_stale_aligned_output(tmp_path, monkeypatch):
@@ -592,6 +735,91 @@ def test_flask_lists_and_replays_only_finalized_session_folders(tmp_path):
     assert client.get("/api/sessions/saved_scan/frames").status_code == 409
     bridge.state = "paused"
     assert client.get("/api/sessions/saved_scan/frames").status_code == 409
+
+
+def test_demo5_repair_reference_and_analysis_routes(tmp_path, monkeypatch):
+    recording = SqliteRecording(tmp_path / "demo5")
+    database_path = recording.path
+    recording.append_frame(
+        recorded_perf_counter_ns=1,
+        source_sec=2,
+        source_nanosec=3,
+        frame_id="world",
+        transformation_name="identity",
+        transformation_matrix=np.eye(4),
+        xyz=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+        rgb=np.array([[100, 100, 100]], dtype=np.uint8),
+    )
+    recording.close()
+    aligned_path = database_path.parent / "aligned_recording.sqlite3"
+    aligned_path.write_bytes(b"aligned")
+    repair_path = tmp_path / "repair.stl"
+    repair_path.write_bytes(b"repair mesh")
+    calls = []
+
+    def fake_segment(path, stl_path, transform):
+        if transform is not None and np.asarray(transform).shape != (4, 4):
+            raise ValueError("transform must be a finite 4x4 matrix")
+        calls.append((path, stl_path, transform))
+        return SimpleNamespace(
+            xyz=np.array([[0.1, -0.2, 0.08]], dtype=np.float32),
+            transform=np.eye(4) if transform is None else transform,
+            scale_m_per_stl_unit=0.0057,
+        )
+
+    monkeypatch.setattr(web_server, "segment_repair", fake_segment)
+    bridge = FakeBridge(database_path)
+    client = create_app(
+        bridge,
+        Path(__file__).parents[1],
+        output_directory=tmp_path,
+        repair_stl_path=repair_path,
+    ).test_client()
+
+    reference = client.get("/api/repair/reference")
+    assert reference.status_code == 200
+    assert reference.data == b"repair mesh"
+    assert reference.content_type == "model/stl"
+    assert reference.headers["Cache-Control"] == "no-store"
+
+    automatic = client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": None},
+    )
+    assert automatic.status_code == 200
+    assert automatic.json["point_count"] == 1
+    assert automatic.json["points"] == pytest.approx([0.1, -0.2, 0.08])
+    assert automatic.json["scale_m_per_stl_unit"] == 0.0057
+    assert calls[0] == (aligned_path, repair_path, None)
+
+    refined_transform = np.eye(4)
+    refined_transform[:3, 3] = [0.125, -0.2342, 0.0802]
+    refined = client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": refined_transform.tolist()},
+    )
+    assert refined.status_code == 200
+    np.testing.assert_allclose(refined.json["transform"], refined_transform)
+    np.testing.assert_allclose(calls[1][2], refined_transform)
+
+    assert client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={},
+    ).status_code == 400
+    assert client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": [[1.0]]},
+    ).status_code == 400
+    assert client.post(
+        "/api/sessions/other/repair-analysis",
+        json={"transform": None},
+    ).status_code == 404
+
+    bridge.state = "recording"
+    assert client.post(
+        "/api/sessions/demo5/repair-analysis",
+        json={"transform": None},
+    ).status_code == 409
 
 
 def test_flask_returns_conflict_for_rejected_ros_command(tmp_path, capfd):

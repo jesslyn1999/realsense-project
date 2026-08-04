@@ -7,7 +7,7 @@ import threading
 import time
 
 from ament_index_python.packages import get_package_share_directory
-from flask import Flask, jsonify, render_template, request, Response
+from flask import Flask, jsonify, render_template, request, Response, send_file
 import message_filters
 import numpy as np
 from object_scanner.pointcloud import transform_to_matrix
@@ -31,6 +31,7 @@ from object_scanner_processing.charuco_observations import (
     CharucoCalibrationError,
     depth_image_to_meters,
 )
+from object_scanner_processing.repair_segmentation import segment_repair
 from object_scanner_web.camera_frame import (
     build_camera_payload,
     build_rgb_payload,
@@ -59,7 +60,18 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 HOST = "0.0.0.0"
 PORT = 5000
+REMOTE_PORT = 5001
+REMOTE_DEMO_SESSION = "demo5"
+REMOTE_COMMANDS = {
+    "start_replay",
+    "next",
+    "show_loading",
+    "stop_loading",
+}
+REMOTE_VIEWER_TIMEOUT_S = 2.0
 MAX_DISPLAY_POINTS = 250_000
+REPAIR_SESSION = "demo5"
+REPAIR_STL_NAME = "pipe-testing08-repair(3).stl"
 SERVICE_TIMEOUT_S = 5.0
 ALIGNMENT_TIMEOUT_S = 600.0
 CAMERA_TIMEOUT_S = 5.0
@@ -132,6 +144,123 @@ def validated_transformation_mode(value) -> str:
     if value not in TRANSFORMATION_MODES:
         raise ValueError("mode must be 'json' or 'charuco'")
     return value
+
+
+class RemoteControl:
+    """Share one pending command and viewer state between both Flask apps."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_command_id = 1
+        self._pending_command: dict | None = None
+        self._last_viewer_report_ns: int | None = None
+        self._last_error: str | None = None
+        self._viewer_state = {
+            "replay_mode": False,
+            "replay_index": 0,
+            "replay_total": 0,
+            "can_next": False,
+            "loading_visible": False,
+            "busy": False,
+            "stage": "raw",
+        }
+
+    def enqueue(self, command: str) -> dict:
+        if command not in REMOTE_COMMANDS:
+            raise ValueError(
+                f"command must be one of {', '.join(sorted(REMOTE_COMMANDS))}"
+            )
+        with self._lock:
+            if self._pending_command is not None:
+                raise RuntimeError("Another remote command is still pending")
+            pending = {
+                "id": self._next_command_id,
+                "command": command,
+            }
+            self._next_command_id += 1
+            self._pending_command = pending
+            self._last_error = None
+            return dict(pending)
+
+    def report_viewer(self, report: dict) -> dict:
+        if not isinstance(report, dict):
+            raise ValueError("viewer report must be a JSON object")
+
+        boolean_fields = (
+            "replay_mode",
+            "can_next",
+            "loading_visible",
+            "busy",
+        )
+        for field in boolean_fields:
+            if not isinstance(report.get(field), bool):
+                raise ValueError(f"{field} must be a boolean")
+
+        integer_fields = ("replay_index", "replay_total")
+        for field in integer_fields:
+            value = report.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+
+        stage = report.get("stage")
+        if stage not in REPLAY_STAGES:
+            raise ValueError(
+                f"stage must be one of {', '.join(sorted(REPLAY_STAGES))}"
+            )
+
+        completed_command_id = report.get("completed_command_id")
+        if completed_command_id is not None and (
+            isinstance(completed_command_id, bool)
+            or not isinstance(completed_command_id, int)
+            or completed_command_id < 1
+        ):
+            raise ValueError("completed_command_id must be a positive integer")
+
+        error = report.get("error")
+        if error is not None and not isinstance(error, str):
+            raise ValueError("error must be a string")
+
+        viewer_state = {
+            field: report[field]
+            for field in (*boolean_fields, *integer_fields)
+        }
+        viewer_state["stage"] = stage
+
+        now_ns = time.perf_counter_ns()
+        with self._lock:
+            if completed_command_id is not None:
+                if (
+                    self._pending_command is None
+                    or self._pending_command["id"] != completed_command_id
+                ):
+                    raise ValueError("completed command is not pending")
+                self._pending_command = None
+                self._last_error = error
+            self._viewer_state = viewer_state
+            self._last_viewer_report_ns = now_ns
+            return self._status_unlocked(now_ns)
+
+    def status(self) -> dict:
+        with self._lock:
+            return self._status_unlocked(time.perf_counter_ns())
+
+    def _status_unlocked(self, now_ns: int) -> dict:
+        connected = (
+            self._last_viewer_report_ns is not None
+            and now_ns - self._last_viewer_report_ns
+            <= int(REMOTE_VIEWER_TIMEOUT_S * 1_000_000_000)
+        )
+        return {
+            **self._viewer_state,
+            "connected": connected,
+            "demo_session": REMOTE_DEMO_SESSION,
+            "pending_command": (
+                None
+                if self._pending_command is None
+                else dict(self._pending_command)
+            ),
+            "last_error": self._last_error,
+        }
 
 
 class RosControlBridge(Node):
@@ -816,6 +945,8 @@ def create_app(
     bridge,
     share_directory: Path | None = None,
     output_directory: Path | None = None,
+    remote_control: RemoteControl | None = None,
+    repair_stl_path: Path | None = None,
 ) -> Flask:
     """Create the Flask API around a ROS control bridge."""
     if share_directory is None:
@@ -829,6 +960,11 @@ def create_app(
     )
     if output_directory is None:
         output_directory = Path(bridge.output_directory)
+    if remote_control is None:
+        remote_control = RemoteControl()
+    if repair_stl_path is None:
+        repair_stl_path = share_directory / "repair" / REPAIR_STL_NAME
+    repair_stl_path = Path(repair_stl_path)
 
     def session_database_path(session_name: str) -> Path:
         name = validated_session_name(session_name)
@@ -842,6 +978,25 @@ def create_app(
     @app.get("/")
     def index():
         return render_template("index.html")
+
+    @app.get("/api/remote/command")
+    def remote_command():
+        current = remote_control.status()
+        return jsonify(
+            command=current["pending_command"],
+            demo_session=current["demo_session"],
+            loading_visible=current["loading_visible"],
+        )
+
+    @app.post("/api/remote/viewer")
+    def remote_viewer():
+        try:
+            current = remote_control.report_viewer(
+                request.get_json(silent=True)
+            )
+        except ValueError as error:
+            return jsonify(success=False, message=str(error)), 400
+        return jsonify(current)
 
     @app.get("/api/status")
     def status():
@@ -874,6 +1029,62 @@ def create_app(
                 )
         saved_sessions.sort(key=lambda session: session["name"])
         return jsonify(sessions=saved_sessions)
+
+    @app.get("/api/repair/reference")
+    def repair_reference():
+        if not repair_stl_path.is_file():
+            return (
+                jsonify(success=False, message="Repair reference STL not found"),
+                404,
+            )
+        response = send_file(repair_stl_path, mimetype="model/stl")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/api/sessions/<session_name>/repair-analysis")
+    def repair_analysis(session_name):
+        try:
+            if session_name != REPAIR_SESSION:
+                raise FileNotFoundError(
+                    f"Repair analysis is available only for '{REPAIR_SESSION}'"
+                )
+            if bridge.status()["state"] != "stopped":
+                return (
+                    jsonify(
+                        success=False,
+                        message="Stop recording before repair analysis",
+                    ),
+                    409,
+                )
+            database_path = session_database_path(session_name)
+            aligned_path = aligned_database_path(database_path)
+            if not aligned_path.is_file():
+                raise FileNotFoundError(
+                    f"Aligned recording not found for session '{session_name}'"
+                )
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict) or "transform" not in body:
+                raise ValueError("JSON body must contain transform")
+            transform = body["transform"]
+            result = segment_repair(
+                aligned_path,
+                repair_stl_path,
+                None if transform is None else np.asarray(transform),
+            )
+        except ValueError as error:
+            return jsonify(success=False, message=str(error)), 400
+        except FileNotFoundError as error:
+            return jsonify(success=False, message=str(error)), 404
+        except (AlignedRecordingError, RuntimeError, sqlite3.Error) as error:
+            app.logger.exception("Repair analysis failed: %s", error)
+            return jsonify(success=False, message=str(error)), 500
+        return jsonify(
+            success=True,
+            transform=result.transform.tolist(),
+            points=result.xyz.reshape(-1).tolist(),
+            point_count=len(result.xyz),
+            scale_m_per_stl_unit=result.scale_m_per_stl_unit,
+        )
 
     @app.get("/api/sessions/<session_name>/frames")
     def session_frames(session_name):
@@ -1235,6 +1446,48 @@ def create_app(
     return app
 
 
+def create_remote_app(
+    remote_control: RemoteControl,
+    share_directory: Path | None = None,
+) -> Flask:
+    """Create the small remote-control page served on port 5001."""
+    if share_directory is None:
+        share_directory = Path(
+            get_package_share_directory("object_scanner_web")
+        )
+    app = Flask(
+        f"{__name__}_remote",
+        template_folder=str(share_directory / "templates"),
+        static_folder=str(share_directory / "static"),
+    )
+
+    @app.get("/remote")
+    def remote():
+        return render_template(
+            "remote.html",
+            demo_session=REMOTE_DEMO_SESSION,
+        )
+
+    @app.get("/api/status")
+    def remote_status():
+        return jsonify(remote_control.status())
+
+    @app.post("/api/command")
+    def remote_command():
+        body = request.get_json(silent=True)
+        try:
+            pending = remote_control.enqueue(
+                body.get("command") if isinstance(body, dict) else None
+            )
+        except ValueError as error:
+            return jsonify(success=False, message=str(error)), 400
+        except RuntimeError as error:
+            return jsonify(success=False, message=str(error)), 409
+        return jsonify(success=True, pending_command=pending), 202
+
+    return app
+
+
 def main(args=None) -> None:
     rclpy.init(args=args)
     bridge = RosControlBridge()
@@ -1246,7 +1499,21 @@ def main(args=None) -> None:
         daemon=True,
     )
     executor_thread.start()
-    app = create_app(bridge)
+    remote_control = RemoteControl()
+    app = create_app(bridge, remote_control=remote_control)
+    remote_app = create_remote_app(remote_control)
+    remote_thread = threading.Thread(
+        target=lambda: remote_app.run(
+            host=HOST,
+            port=REMOTE_PORT,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        ),
+        name="object-scanner-web-remote",
+        daemon=True,
+    )
+    remote_thread.start()
     try:
         app.run(
             host=HOST,

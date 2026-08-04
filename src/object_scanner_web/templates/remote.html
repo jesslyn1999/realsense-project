@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Scanner Remote</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body class="remote-page">
+    <main class="remote-control">
+      <p class="eyebrow">Object scanner</p>
+      <h1>Display remote</h1>
+      <p id="remote-status" class="remote-status">Connecting to main viewer…</p>
+
+      <div class="remote-button-grid">
+        <button
+          id="remote-start-replay"
+          class="primary"
+          type="button"
+          disabled
+        >Start replay {{ demo_session }}</button>
+        <button id="remote-next" type="button" disabled>Next →</button>
+        <button id="remote-show-loading" type="button" disabled>
+          Show loading
+        </button>
+        <button id="remote-stop-loading" type="button" disabled>
+          Stop loading
+        </button>
+      </div>
+    </main>
+    <script
+      type="module"
+      src="{{ url_for('static', filename='remote.js') }}"
+    ></script>
+  </body>
+</html>
